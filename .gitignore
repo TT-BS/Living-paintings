@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.DS_Store
+# job folders made with the skill (pictures, layers, frames) belong to their owners, not to this repo
+/jobs/

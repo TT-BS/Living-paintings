@@ -1,0 +1,1005 @@
+#!/bin/sh
+''':'
+# This file is a shell script and a Python program at once; the shell part only picks the Python that runs the rest.
+# Finder, the Dock and Shortcuts start commands with a bare PATH, where python3 is Apple's /usr/bin/python3, and
+# without the Command Line Tools that stub opens an installer dialog instead of running. So: LIVING_PICTURE_PYTHON,
+# python3 on PATH unless it is that stub, the usual Homebrew, conda and python.org places, and the stub last, only
+# when the developer tools are installed.
+use() { if [ -n "$1" ] && [ -x "$1" ] && [ ! -d "$1" ]; then p="$1"; shift; exec "$p" "$0" "$@"; fi; }
+[ -z "${LIVING_PICTURE_PYTHON:-}" ] || use "$(command -v "$LIVING_PICTURE_PYTHON")" "$@"
+stub=; [ ! -e /usr/bin/xcode-select ] || stub=/usr/bin/python3  # only a Mac has the stub; elsewhere it is a real Python
+py="$(command -v python3)"; { [ -n "$stub" ] && [ "$py" = "$stub" ]; } || use "$py" "$@"
+for d in /opt/homebrew/bin /usr/local/bin /opt/miniconda3/bin "$HOME/miniconda3/bin" /opt/anaconda3/bin "$HOME/anaconda3/bin" "$HOME/miniforge3/bin" /opt/homebrew/Caskroom/miniforge/base/bin /Library/Frameworks/Python.framework/Versions/Current/bin; do
+  use "$d/python3" "$@"
+done
+d="$(xcode-select -p 2>/dev/null)" && [ -d "$d" ] && use /usr/bin/python3 "$@"
+echo "living-picture: no python3 that can run here. Install Python 3 (brew install python, or python.org) or set LIVING_PICTURE_PYTHON; Apple's /usr/bin/python3 works once the Command Line Tools are installed: xcode-select --install" >&2
+exit 2
+'''
+# living-picture: one command for the tools of the living-picture skill.
+#
+# SKILL.md is the judgment: an agent reads the picture and decides. This command only runs the tools, so any agent
+# (Claude Code, Codex) or a person can call them without knowing where the skill is installed. It resolves its own
+# real path, so it works through symlinks such as ~/.local/bin/living-picture. Standard library only.
+import argparse
+import datetime
+import filecmp
+import glob
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+SCRIPTS = os.path.join(ROOT, "scripts")
+PICTURE = os.path.join(SCRIPTS, "picture.py")
+CAPTURE = os.path.join(SCRIPTS, "capture.mjs")
+BRIDGE = os.path.join(SCRIPTS, "codex_bridge.py")
+NAME = "living-picture"
+HOME = os.path.expanduser("~")
+CACHE = os.path.join(HOME, "Library", "Caches", NAME)
+DEPS = (("numpy", "numpy"), ("scipy", "scipy"), ("PIL", "Pillow"))
+# Apps started from the Dock, Shortcuts or Finder get a bare PATH without Homebrew,
+# yet capture still needs node and ffmpeg there.
+EXTRA_PATH = ("/opt/homebrew/bin", "/usr/local/bin")
+# Share platforms deliver far smaller pictures (the marked downloads seen here are 928-1440 px), while the watermark
+# search runs at full resolution: about 3 s and 0.15 GB per megapixel, 100 s and 2.4 GB on a 24 MP photo. So `new`
+# searches only pictures up to this longer side; `picture.py dewatermark` still searches any picture by hand.
+WATERMARK_MAX_SIDE = 2560
+q = shlex.quote  # paths inside the commands that `new` suggests, so they paste intact
+
+
+def die(msg, code=2):
+    sys.stderr.write("living-picture: %s\n" % msg)
+    sys.exit(code)
+
+
+def child_env():
+    env = dict(os.environ)
+    parts = [p for p in env.get("PATH", "").split(os.pathsep) if p]
+    parts += [d for d in EXTRA_PATH if os.path.isdir(d) and d not in parts]
+    env["PATH"] = os.pathsep.join(parts)
+    return env
+
+
+ENV = child_env()
+
+
+def which(name):
+    return shutil.which(name, path=ENV["PATH"])
+
+
+def probe(cmd, timeout=30):
+    """(exit code, stdout, stderr) of a short command; never raises."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=ENV)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return -1, "", str(e)
+
+
+def exec_(cmd):
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        os.execvpe(cmd[0], cmd, ENV)
+    except OSError as e:
+        die("cannot run %s: %s" % (cmd[0], e))
+
+
+def inside(path, parent):
+    p, q = os.path.realpath(path), os.path.realpath(parent)
+    return p == q or p.startswith(q.rstrip(os.sep) + os.sep)
+
+
+def sha256(path, n=None):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()[:n] if n else h.hexdigest()
+
+
+def tilde(p):
+    return "~" + p[len(HOME):] if p == HOME or p.startswith(HOME + os.sep) else p
+
+
+# ---- the Python that runs picture.py ---------------------------------------------------
+
+def _has_deps_here():
+    import importlib.util
+    return all(importlib.util.find_spec(m) for m, _ in DEPS)
+
+
+def _has_deps(py):
+    code = "import importlib.util as u,sys;sys.exit(0 if all(u.find_spec(m) for m in %r) else 1)" % ([m for m, _ in DEPS],)
+    return probe([py, "-c", code])[0] == 0
+
+
+def python_candidates():
+    c = [which("python3"), "/opt/homebrew/bin/python3", "/usr/local/bin/python3",
+         "/opt/miniconda3/bin/python3", os.path.join(HOME, "miniconda3/bin/python3"),
+         "/opt/anaconda3/bin/python3", os.path.join(HOME, "anaconda3/bin/python3"),
+         os.path.join(HOME, "miniforge3/bin/python3"), "/opt/homebrew/Caskroom/miniforge/base/bin/python3",
+         "/Library/Frameworks/Python.framework/Versions/Current/bin/python3"]
+    out, seen = [], {os.path.realpath(sys.executable)}
+    for p in c:
+        # on a Mac /usr/bin/python3 is a stub that can pop up the Command Line Tools installer: never probe it
+        if not p or (p == "/usr/bin/python3" and sys.platform == "darwin") or os.path.isdir(p) or not os.access(p, os.X_OK):
+            continue
+        r = os.path.realpath(p)
+        if r not in seen:
+            seen.add(r)
+            out.append(p)
+    return out
+
+
+_PY = []
+
+
+def tools_python():
+    """$LIVING_PICTURE_PYTHON, else this interpreter if it has numpy/scipy/Pillow, else the first one found that does.
+
+    A Mac often has several Pythons (Apple's, python.org, Homebrew, conda) and only one of them has the packages.
+    """
+    if not _PY:
+        env = os.environ.get("LIVING_PICTURE_PYTHON")
+        if env:
+            _PY.append((env, "LIVING_PICTURE_PYTHON"))
+        elif _has_deps_here():
+            _PY.append((sys.executable, "the interpreter running this command"))
+        else:
+            other = next((p for p in python_candidates() if _has_deps(p)), None)
+            _PY.append((other, "found: the interpreter running this command lacks the packages") if other
+                       else (sys.executable, "the interpreter running this command (packages missing)"))
+    return _PY[0]
+
+
+def find_node():
+    return os.environ.get("LIVING_PICTURE_NODE") or which("node")
+
+
+_BRIDGE = []
+
+
+def bridge():
+    """scripts/codex_bridge.py as a module, or None. It owns finding Codex and asking its version, so doctor and the
+    bridge agree."""
+    if not _BRIDGE:
+        try:
+            sys.path.insert(0, SCRIPTS)
+            sys.dont_write_bytecode = True  # keep the shared skill folder free of __pycache__
+            import codex_bridge
+            _BRIDGE.append(codex_bridge)
+        except Exception:
+            _BRIDGE.append(None)
+    return _BRIDGE[0]
+
+
+def find_codex():
+    b = bridge()
+    return b.find_codex() if b else which("codex")
+
+
+def codex_version(codex):
+    # never a bare `codex --version`: even that writes under $CODEX_HOME (the bridge gives it a throwaway one)
+    b = bridge()
+    return b.codex_version(codex) if b else None
+
+
+OWN = ("capture", "new", "doctor", "paths", "help", "codex")  # this command's own names win over picture.py's
+
+
+def picture_commands():
+    """[(name, help)] read from picture.py's own parser, so new tools (vision, ...) show up by themselves."""
+    try:
+        with open(PICTURE, encoding="utf-8") as f:
+            src = f.read()
+    except OSError:
+        return []
+    out = []
+    for m in re.finditer(r"""add_parser\(\s*(['"])([\w-]+)\1\s*(?:,\s*help\s*=\s*(['"])(.*?)\3)?""", src):
+        if m.group(2) not in OWN and m.group(2) not in [n for n, _ in out]:
+            out.append((m.group(2), m.group(4) or ""))
+    return out
+
+
+def usage():
+    pic = picture_commands()
+    names = [n for n, _ in pic]
+    row = lambda n, h: "  %-9s %s" % (n, h)  # noqa: E731
+    lines = ["usage: living-picture <command> [options]        (every command takes --help)", "",
+             "Tools of the living-picture skill in %s" % ROOT,
+             "The agent judges; these only see, measure, cut and render. Tools print JSON on stdout.", "",
+             "Picture tools (scripts/picture.py):"]
+    lines += [row(n, h) for n, h in pic]
+    if "vision" not in names:
+        lines.append(row("vision", "(not in this copy; appears when picture.py has the macOS Vision helper)"))
+    lines += ["", "Frames and video (scripts/capture.mjs; Node 22+ and Chrome, Chromium or Edge):",
+              row("capture", "render frames, probes or a short video of a bundled page"), "",
+              "Jobs and setup:",
+              row("new", "start a job folder for a picture: watermark check, prepare, look, notes.md (refuses inside git or over a job)"),
+              row("doctor", "check Python packages, Node, browser, video, Xcode tools, Codex and installs"),
+              row("paths", "where the skill's files are (JSON)"),
+              row("help", "help CMD is CMD --help"), "",
+              "Opt-in Codex bridge (scripts/codex_bridge.py; sends nothing without --consent-upload):",
+              row("codex", "codex review FRAME...  an independent review of rendered frames by Codex"),
+              row("", "codex plate            how a Codex imagegen plate repair works and what it sends"), "",
+              "Environment: LIVING_PICTURE_PYTHON (a python3 with numpy, scipy, Pillow), LIVING_PICTURE_NODE,",
+              "CHROME_PATH (browser for capture), LIVING_PICTURE_CODEX (codex binary).",
+              "Docs: SKILL.md (how to work), references/invocation.md (install, CLI, batches, Codex)."]
+    return "\n".join(lines) + "\n"
+
+
+# ---- doctor ----------------------------------------------------------------------------
+
+VERSIONS = ("import json, sys\n"
+            "v = {'python': '.'.join(map(str, sys.version_info[:3]))}\n"
+            "for m, n in (('numpy', 'numpy'), ('scipy', 'scipy'), ('PIL', 'Pillow')):\n"
+            "    try:\n"
+            "        v[n] = __import__(m).__version__\n"
+            "    except Exception:\n"
+            "        v[n] = None\n"
+            "print(json.dumps(v))\n")
+
+
+def browser_candidates():
+    """The places capture.mjs looks for a browser, read from its findChrome so the two cannot disagree."""
+    try:
+        with open(CAPTURE, encoding="utf-8") as f:
+            src = f.read()
+        body = src[src.index("function findChrome"):]
+        body = body[:body.index("\n}")]
+        found = [p.replace("\\\\", "\\") for p in re.findall(r"""['"]((?:/|[A-Z]:\\\\)[^'"]+)['"]""", body)]
+        if found:
+            return found
+    except (OSError, ValueError):
+        pass
+    return ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"]
+
+
+def install_state(path):
+    """How `path` relates to this folder: this folder, a link to it, a link elsewhere, a separate copy, or nothing."""
+    if os.path.islink(path):
+        target = os.readlink(path)
+        if not os.path.exists(path):
+            return "dangling symlink", {"target": target}
+        if os.path.realpath(path) == os.path.realpath(ROOT if os.path.isdir(path) else os.path.join(ROOT, "bin", NAME)):
+            return "symlink to this folder" if os.path.isdir(path) else "symlink to this command", {"target": target}
+        return "symlink elsewhere", {"target": os.path.realpath(path)}
+    if os.path.isdir(path):
+        if os.path.realpath(path) == ROOT:
+            return "this folder", {}
+        md = os.path.join(path, "SKILL.md")
+        same = os.path.isfile(md) and sha256(md) == sha256(os.path.join(ROOT, "SKILL.md"))
+        return "separate copy", {"same_skill_md": same}
+    if os.path.exists(path):
+        return "a file", {}
+    return "missing", {}
+
+
+def cmd_doctor(argv):
+    ap = argparse.ArgumentParser(prog="living-picture doctor",
+                                 description="Check what the skill's tools need on this machine and where the skill is "
+                                             "installed for Claude Code, Codex and ~/.agents. Exits 1 if something required is missing.")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--json", action="store_true", help="JSON report (the default when stdout is not a terminal)")
+    g.add_argument("--text", action="store_true", help="readable report (the default in a terminal)")
+    a = ap.parse_args(argv)
+    checks = []
+
+    def add(area, status, detail, fix=None, required=False, **extra):
+        c = {"area": area, "status": status, "detail": detail}
+        if fix:
+            c["fix"] = fix
+        if required:
+            c["required"] = True
+        c.update(extra)
+        checks.append(c)
+
+    # picture.py: Python 3.9+ with numpy, scipy, Pillow
+    py, why = tools_python()
+    code, out, err = probe([py, "-c", VERSIONS])
+    try:
+        v = json.loads(out)
+    except ValueError:
+        v = None
+    if code != 0 or not v:
+        add("python", "missing", "cannot run %s: %s" % (py, err or out),
+            "fix LIVING_PICTURE_PYTHON or unset it" if os.environ.get("LIVING_PICTURE_PYTHON")
+            else "set LIVING_PICTURE_PYTHON to a python3 with numpy, scipy, Pillow", True)
+    else:
+        lacking = [n for _, n in DEPS if not v.get(n)]
+        if lacking:
+            others = [p for p in [sys.executable] + python_candidates()
+                      if os.path.realpath(p) != os.path.realpath(py) and _has_deps(p)]
+            fix = "%s -m pip install numpy scipy pillow" % py
+            if others:
+                fix += "  (or use %s: export LIVING_PICTURE_PYTHON=%s)" % (others[0], others[0])
+            add("python", "missing", "%s %s lacks %s" % (py, v["python"], ", ".join(lacking)), fix, True)
+        elif tuple(int(x) for x in v["python"].split(".")[:2]) < (3, 9):
+            add("python", "old", "%s is Python %s; the tools need 3.9+" % (py, v["python"]), "set LIVING_PICTURE_PYTHON", True)
+        else:
+            add("python", "ok", "%s %s: numpy %s, scipy %s, Pillow %s" % (py, v["python"], v["numpy"], v["scipy"], v["Pillow"]),
+                required=True, interpreter=py, chosen_by=why)
+
+    # capture.mjs: Node 22+ (built-in WebSocket) and a Chromium-family browser
+    node = find_node()
+    via = "LIVING_PICTURE_NODE=" if os.environ.get("LIVING_PICTURE_NODE") else ""
+    if not node:
+        add("node", "missing", "node not found", "brew install node (22 or newer), or set LIVING_PICTURE_NODE", True)
+    else:
+        code, out, err = probe([node, "--version"])
+        m = re.match(r"v(\d+)", out)
+        if not m:  # it does not run at all: a wrong path or a broken install, not an old Node
+            add("node", "missing", "%s%s does not run: %s" % (via, node, err or out or "exit %d" % code),
+                "fix LIVING_PICTURE_NODE or unset it" if via else "reinstall Node 22+ (brew install node)", True)
+        elif int(m.group(1)) >= 22:
+            add("node", "ok", "%s %s" % (node, out), required=True)
+        else:
+            add("node", "old", "%s%s %s: capture needs Node 22+" % (via, node, out),
+                "point LIVING_PICTURE_NODE at Node 22+" if via else "brew upgrade node", True)
+    # capture.mjs takes the first that exists of --chrome, CHROME_PATH and its own list, so a wrong CHROME_PATH is
+    # skipped there, not fatal
+    chrome = os.environ.get("CHROME_PATH")
+    if chrome and not os.path.exists(chrome):
+        add("CHROME_PATH", "warn", "CHROME_PATH=%s does not exist; capture skips it and looks in the usual places" % chrome,
+            "fix CHROME_PATH or unset it")
+    found = next((p for p in ([chrome] if chrome else []) + browser_candidates() if os.path.exists(p)), None)
+    if found:
+        add("browser", "ok", found + (" (CHROME_PATH)" if found == chrome else ""), required=True)
+    else:
+        add("browser", "missing", "no Chrome, Chromium or Edge where capture.mjs looks", "install Google Chrome, or set CHROME_PATH", True)
+
+    # video and the Apple helpers
+    swift_ok = False
+    if sys.platform == "darwin":
+        code, devdir, _ = probe(["xcode-select", "-p"])
+        if code != 0:  # checked first: a bare xcrun can pop up the installer dialog
+            add("swiftc", "missing", "no Xcode or Command Line Tools: the Apple helpers are skipped", "xcode-select --install")
+        else:
+            code, _, _ = probe(["xcrun", "--find", "swiftc"])
+            if code == 0:
+                _, o, e = probe(["xcrun", "swiftc", "--version"], timeout=90)
+                m = re.search(r"Swift version ([\w.\-]+)", o + " " + e)
+                add("swiftc", "ok", "Swift %s (%s)" % (m.group(1) if m else "?", devdir))
+                swift_ok = True
+            else:
+                add("swiftc", "missing", "xcrun finds no swiftc in %s" % devdir, "xcode-select --install")
+    else:
+        add("swiftc", "info", "not macOS: the Apple helpers are skipped; the other tools work")
+    helpers = sorted(glob.glob(os.path.join(SCRIPTS, "macos", "*.swift")))
+    if helpers:
+        states = []
+        for h in helpers:
+            stem = os.path.splitext(os.path.basename(h))[0]
+            binary = os.path.join(CACHE, "%s-%s" % (stem, sha256(h, 12)))
+            states.append("%s (%s)" % (stem, "compiled" if os.access(binary, os.X_OK) else
+                                       "compiles on first use" if swift_ok else "needs Xcode tools"))
+        add("apple helpers", "info", ", ".join(states), cache=CACHE)
+    else:
+        add("apple helpers", "info", "none in this copy of the skill")
+    ff = which("ffmpeg")
+    avf = os.path.exists(os.path.join(SCRIPTS, "macos", "lpencode.swift"))
+    if ff:
+        _, out, _ = probe([ff, "-version"])
+        m = re.search(r"ffmpeg version (\S+)", out)
+        add("ffmpeg", "ok", "ffmpeg %s (%s)" % (m.group(1) if m else "?", ff))
+    elif avf and swift_ok:
+        add("ffmpeg", "info", "ffmpeg not found; video can use the AVFoundation encoder (lpencode)")
+    else:
+        add("ffmpeg", "missing", "ffmpeg not found: capture --video cannot encode", "brew install ffmpeg" + (" or xcode-select --install" if avf else ""))
+    if sys.platform == "darwin":
+        add("macos tools", "info", ", ".join("%s %s" % (t, "yes" if os.path.exists("/usr/bin/" + t) else "no")
+                                             for t in ("sips", "avconvert", "qlmanage", "shortcuts")))
+
+    # Codex (only for the opt-in bridges)
+    codex = find_codex()
+    if codex:
+        ver = codex_version(codex)
+        add("codex", "ok" if ver else "info", "%s (%s)%s" % (ver or "version unknown", codex, "" if which("codex") else ", not on PATH"))
+    else:
+        add("codex", "info", "Codex CLI not found (optional: only the opt-in bridges use it)")
+
+    # where the skill is installed
+    claude_home = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+    codex_home = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
+    linked = {}
+    for area, path, home in (("install claude", os.path.join(claude_home, "skills", NAME), claude_home),
+                             ("install agents", os.path.join(HOME, ".agents", "skills", NAME), os.path.join(HOME, ".agents")),
+                             ("install codex", os.path.join(codex_home, "skills", NAME), codex_home),
+                             ("install cli", os.path.join(HOME, ".local", "bin", NAME), None)):
+        state, extra = install_state(path)
+        good = state in ("this folder", "symlink to this folder", "symlink to this command")
+        linked[area] = state if good else None
+        detail = "%s: %s" % (tilde(path), state)
+        if extra.get("target"):
+            detail += " (%s)" % tilde(extra["target"])
+        if state == "separate copy":
+            detail += "; SKILL.md %s this folder's" % ("matches" if extra["same_skill_md"] else "differs from")
+        fix = None
+        if state == "missing" and area == "install codex":
+            # current Codex reads ~/.agents/skills; this folder only matters to an older release
+            detail += " (optional: Codex reads ~/.agents/skills)"
+            fix = "only for a Codex that does not read ~/.agents/skills: scripts/install.sh --only codex"
+        elif state == "missing":
+            fix = "scripts/install.sh%s" % (" --with-cli" if area == "install cli" else "") + \
+                  ("" if home is None or os.path.isdir(home) else " (the agent's folder %s does not exist yet)" % tilde(home))
+        elif not good:
+            fix = "left alone by scripts/install.sh; remove or rename it yourself if this folder should be used"
+        add(area, "ok" if good else "info", detail, fix, path=path, state=state, **extra)
+    if linked["install agents"] and linked["install codex"]:
+        # Codex reads both folders and its docs say same-name skills are not merged
+        extra_link = "codex" if linked["install codex"].startswith("symlink") else "agents"
+        add("install twice", "warn", "both ~/.agents/skills and %s/skills lead to this folder: Codex reads both and may list "
+            "living-picture twice" % tilde(codex_home), "keep one: scripts/install.sh --uninstall --only %s --apply" % extra_link)
+    on_path = which(NAME)
+    add("cli on PATH", "ok" if on_path and os.path.realpath(on_path) == os.path.realpath(__file__) else "info",
+        "%s%s" % (on_path or "living-picture is not on PATH",
+                  "" if not on_path or os.path.realpath(on_path) == os.path.realpath(__file__) else " (a different copy)"),
+        None if on_path else "scripts/install.sh --with-cli, and ~/.local/bin on PATH")
+
+    failed = [c["area"] for c in checks if c.get("required") and c["status"] != "ok"]
+    as_json = a.json or (not a.text and not sys.stdout.isatty())
+    if as_json:
+        print(json.dumps({"skill": ROOT, "ok": not failed, "missing_required": failed, "checks": checks}, ensure_ascii=False, indent=1))
+    else:
+        print("living-picture doctor: %s" % tilde(ROOT))
+        for c in checks:
+            print("  %-7s %-14s %s" % (c["status"], c["area"], c["detail"] if c["area"].startswith("install") or c["area"] == "cli on PATH"
+                                      else c["detail"].replace(HOME + os.sep, "~" + os.sep)))
+            if c.get("fix") and c["status"] != "ok":
+                print("  %-7s %-14s -> %s" % ("", "", c["fix"]))
+        print("Everything required is in place." if not failed else "Missing or too old: %s" % ", ".join(failed))
+    return 1 if failed else 0
+
+
+# ---- new -------------------------------------------------------------------------------
+
+NOTES = """# 工作笔记：{stem}
+
+<!-- 边做边记：看到了什么、定了什么、为什么。坐标都指 work/picture.png。标题按 SKILL.md 的规则与交接清单。 -->
+
+## 原图身份
+- 原图：{source}
+- sha256：{sha}
+- 大小：{bytes} 字节{source_size}
+- 建立：living-picture new，{date}
+
+## 工作尺寸
+- work/picture.png：{w}×{h} px（相对原图缩放 {scale}）
+
+## 画意
+<!-- 一句话（规则 1）。 -->
+
+## 读画
+<!-- 材料；光与空气；支撑和遮挡；前后关系；保护区域；笔触画的是物体还是它的状态。 -->
+
+## 动态主导与幅度
+<!-- 选了什么、为什么最能传达画意；目标显示尺寸；因画意而小的依据（与缩幅遮错分开）。 -->
+
+## 因果与节奏
+<!-- 原因、承载者、响应、后果与恢复；每个原因的传递链；静的时候还剩什么；指针或触摸算“有人经过”；没有指针时（手机）怎么活。 -->
+
+## 关系
+<!-- 附着、支撑、接触、柔性连接、反射；哪些随承载者动，哪些相对动。 -->
+
+## 资产处理
+<!-- 分层与选区方法、补底方式、每轮 work/review/ 的发现。 -->
+
+## 动态与镜头参数
+<!-- scene.json 要点：深度、风、光、镜头、通道、hooks。 -->
+
+## 工具版本
+- 技能：{skill}（scripts 与 runtime 指纹 {fingerprint}）
+<!-- 用到的可选工具（vision、视频编码等）。 -->
+
+## 验证范围
+<!-- 做了哪些检查、在什么尺寸、证据路径（check/…）。 -->
+
+## 未决
+<!-- 没做好的和未审的（例如只看了帧条，节奏未审）。 -->
+
+## 规则 8 取舍
+<!-- 仅在真冲突时：试过的替代、哪一项承载画意、公开让了什么。 -->
+
+## 交付说明
+<!-- 告诉使用者：让什么活了、为什么；什么故意留着不动；哪里没做好。 -->
+"""
+
+
+def git_root(path):
+    for start in {os.path.abspath(path), os.path.realpath(path)}:
+        p = start
+        while True:
+            if os.path.exists(os.path.join(p, ".git")):
+                return p
+            parent = os.path.dirname(p)
+            if parent == p:
+                break
+            p = parent
+    return None
+
+
+def skill_fingerprint():
+    h = hashlib.sha256()
+    files = sorted(glob.glob(os.path.join(SCRIPTS, "**", "*.*"), recursive=True) +
+                   glob.glob(os.path.join(ROOT, "runtime", "src", "*.js")))
+    for f in files:
+        if f.endswith((".py", ".mjs", ".js", ".swift")) and "__pycache__" not in f:
+            h.update(os.path.relpath(f, ROOT).encode())
+            h.update(sha256(f).encode())
+    return h.hexdigest()[:12]
+
+
+def run_tool(cmd):
+    """Run a picture.py command, let its log through, return its JSON."""
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, text=True, env=ENV)
+    if p.returncode:
+        sys.stdout.write(p.stdout)
+        die("%s failed (exit %d)" % (" ".join(cmd[2:4]), p.returncode), p.returncode)
+    return json.loads(p.stdout.strip().splitlines()[-1])
+
+
+def last_json(text):
+    """The JSON object on the last line of a tool's stdout, or {}."""
+    try:
+        o = json.loads((text or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {}
+    return o if isinstance(o, dict) else {}
+
+
+def write_text(path, text):
+    """Replace a file in one step, so an interrupted write never leaves half a notes.md."""
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def add_to_section(text, heading, line):
+    """text with `line` added at the end of its '## heading' section (at the end of the text if it has none)."""
+    m = re.search(r"^## %s[ \t]*\n" % re.escape(heading), text, re.M)
+    if not m:
+        return text.rstrip("\n") + "\n\n" + line
+    nxt = re.search(r"^## ", text[m.end():], re.M)
+    end = m.end() + nxt.start() if nxt else len(text)
+    body = text[m.end():end].rstrip("\n")
+    return text[:m.end()] + (body + "\n" if body else "") + line + ("\n" if nxt else "") + text[end:]
+
+
+# Written first, before anything is prepared: creating notes.md exclusively is the job folder's claim, so a second
+# run into the same folder (Hero/ and hero/ are one folder on a Mac) is refused instead of mixing two pictures.
+PENDING = "living-picture new 正在准备这个工作目录"
+NOTES_PENDING = """# 工作笔记：{stem}
+
+<!-- {mark}（{date}）。如果它停在这里没有完成：确认没有别的运行在用这个目录，删掉本文件再运行一次。 -->
+
+## 原图身份
+- 原图：{source}
+- sha256：{sha}
+"""
+
+
+def png_size(path):
+    """[width, height] from a PNG header, or None."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(24)
+    except OSError:
+        return None
+    if len(head) == 24 and head[:8] == b"\x89PNG\r\n\x1a\n" and head[12:16] == b"IHDR":
+        return list(struct.unpack(">II", head[16:24]))
+    return None
+
+
+def job_state(job):
+    """What a folder holds of a job (its notes.md identity lines, the working size), or None if it holds none."""
+    notes, pic = os.path.join(job, "notes.md"), os.path.join(job, "work", "picture.png")
+    held = [n for n, p in (("notes.md", notes), ("work/picture.png", pic)) if os.path.exists(p)]
+    if not held:
+        return None
+    try:
+        with open(notes, encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, ValueError):
+        text = ""
+    source = re.search(r"^- 原图：(.+)$", text, re.M)
+    sha = re.search(r"^- sha256：([0-9a-f]{64})\s*$", text, re.M)
+    size = png_size(pic)
+    if not size:
+        m = re.search(r"^- work/picture\.png：(\d+)×(\d+) px", text, re.M)
+        size = [int(m.group(1)), int(m.group(2))] if m else None
+    made = FROM.findall(text)  # the last "工作图由 … 准备" that new or --reprepare wrote
+    return {"held": held, "source": source.group(1).strip() if source else None, "sha256": sha.group(1) if sha else None,
+            "pending": PENDING in text, "size": size,
+            "prepared_from": ("clean.png" if "clean" in made[-1] else "picture") if made else None}
+
+
+def held_message(job, st, sha):
+    if st["pending"]:
+        return ("another `living-picture new` is preparing %s, or one stopped there before finishing (notes.md is still "
+                "its placeholder, for %s); if no run is working there, delete that notes.md and run again" % (job, st["source"]))
+    where = "%s already holds a job (%s)" % (job, ", ".join(st["held"]))
+    if not st["sha256"]:
+        return where + " whose picture cannot be confirmed: its notes.md has no sha256 line"
+    if st["sha256"] == sha:
+        return where + " for this same picture (notes.md: 原图 %s, same sha256)" % st["source"]
+    return where + " for another picture (notes.md: 原图 %s, sha256 %s…; this picture's is %s…)" % (
+        st["source"], st["sha256"][:12], sha[:12])
+
+
+def on_grid(job):
+    """Files of a job that refer to work/picture.png's pixel grid."""
+    return sorted(os.path.basename(p) for p in glob.glob(os.path.join(job, "*.json"))) + \
+        [n for n in ("work/layers", "work/review", "out") if os.path.exists(os.path.join(job, n))]
+
+
+def find_watermark(image, tmp):
+    """Run picture.py dewatermark on the picture into tmp. Returns its report with "search" set to "removed"
+    (clean.png and clean-review.jpg are then in tmp), "none found" (its exit 4) or "failed": a crash, an
+    out-of-memory kill or an unreadable file is reported with the tool's last words, never taken for "none found"."""
+    py, _ = tools_python()
+    sys.stderr.write("living-picture new: looking for a share-platform watermark in the lower right "
+                     "(--keep-watermark skips this) ...\n")
+    sys.stderr.flush()
+    p = subprocess.run([py, PICTURE, "dewatermark", image, "--out", os.path.join(tmp, "clean.png")],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=ENV)
+    rep = last_json(p.stdout)
+    if p.returncode == 0 and rep.get("found") and os.path.isfile(os.path.join(tmp, "clean.png")):
+        return dict(rep, search="removed")
+    if p.returncode in (0, 4) and rep.get("found") is False:
+        return {"search": "none found"}
+    how = ("killed by signal %d%s" % (-p.returncode, " (out of memory?)" if p.returncode == -9 else "")
+           if p.returncode < 0 else "exit %d" % p.returncode)
+    said = [ln.strip()[:300] for ln in ("%s\n%s" % (rep.get("error") or "", p.stderr or "")).splitlines() if ln.strip()]
+    return {"search": "failed", "detail": "picture.py dewatermark: %s%s" % (how, ": " + " | ".join(said[-3:]) if said else "")}
+
+
+def prepare_into(job, image, max_side, source=None, search=False):
+    """prepare + look into a fresh hidden folder inside the job, so nothing in place changes unless all succeed.
+    It prepares `source` (default: the picture). With `search` it then looks for a share-platform watermark on the
+    picture, if the picture is no larger than platforms deliver, and prepares from the repaired copy when one was
+    removed. Returns (tmp, prepare report, look report, watermark report or None)."""
+    tmp = tempfile.mkdtemp(prefix=".living-picture-new-", dir=job)
+    try:
+        py, _ = tools_python()
+
+        def prepare(src):
+            return run_tool([py, PICTURE, "prepare", src, "--out", os.path.join(tmp, "work")] +
+                            (["--max", str(max_side)] if max_side else []))
+        prep = prepare(source or image)
+        wm = None
+        if search:
+            # prepare reads every format the tools read, so its scale gives the picture's own size before the search
+            side = int(round(max(prep["size"]) / (prep.get("scale_from_source") or 1)))
+            if side > WATERMARK_MAX_SIDE:
+                wm = {"search": "skipped", "side": side,
+                      "detail": "the picture is %d px on its longer side; share platforms deliver smaller pictures, so "
+                                "only pictures up to %d px are searched (the search runs at full resolution)"
+                                % (side, WATERMARK_MAX_SIDE)}
+            else:
+                wm = find_watermark(image, tmp)
+                if wm["search"] == "removed":
+                    prep = prepare(os.path.join(tmp, "clean.png"))
+        look = run_tool([py, PICTURE, "look", prep["picture"], "--out", os.path.join(tmp, "look.jpg")])
+        return tmp, prep, look, wm
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+
+def move_in(tmp, job):
+    """Put what prepare_into made in its place: same file system, so each file is swapped in one step."""
+    work = os.path.join(job, "work")
+    os.makedirs(work, exist_ok=True)
+    for n in os.listdir(os.path.join(tmp, "work")):
+        os.replace(os.path.join(tmp, "work", n), os.path.join(work, n))
+    os.replace(os.path.join(tmp, "look.jpg"), os.path.join(job, "look.jpg"))
+    for n in ("clean.png", "clean-review.jpg"):              # present only when a platform watermark was removed
+        if os.path.exists(os.path.join(tmp, n)):
+            os.replace(os.path.join(tmp, n), os.path.join(job, n))
+
+
+# What notes.md records about the working copy's source; `--reprepare` reads the last one back.
+FROM = re.compile(r"工作图由(原图| ?clean\.png ?)准备")
+BY_HAND = "若右下角其实有平台水印：dewatermark 原图 --out clean.png（找不到时加 --pill/--line 粗框），核对 clean-review.jpg，再 new --reprepare。"
+
+
+def watermark_note(wm):
+    """The 资产处理 line of a new job: what the watermark step did and what work/picture.png was prepared from."""
+    s = wm["search"]
+    if s == "removed":
+        p = wm.get("pill") or {}
+        how = {"untint": "反推还原", "fill": "按周围颜料重画", "hybrid": "混合"}.get(p.get("mode"), p.get("mode"))
+        return ("- 平台水印：living-picture new 已自动去除（picture.py dewatermark，标志框 %s，%s；ID 行 %s）。原件未改；"
+                "工作图由 clean.png 准备；对比图 clean-review.jpg 需在显示尺寸和 4 倍下核对。\n"
+                % (p.get("rect"), how, (wm.get("line") or {}).get("rect")))
+    if s == "kept":
+        return "- 平台水印：未查找（--keep-watermark）。工作图由原图准备。\n"
+    if s == "none found":
+        return "- 平台水印：living-picture new 在右下角没有找到（picture.py dewatermark）。工作图由原图准备。\n"
+    if s == "skipped":
+        return ("- 平台水印：未查找：原图长边 %d px，大于平台下载图（%d px 以内才自动查找，全尺寸查找很慢）。工作图由原图准备。%s\n"
+                % (wm["side"], WATERMARK_MAX_SIDE, BY_HAND))
+    return "- 平台水印：查找失败（%s）。工作图由原图准备。%s\n" % (wm["detail"], BY_HAND)
+
+
+def set_aside(job):
+    """Rename clean.png and clean-review.jpg to clean-unused[-N]…, so the job no longer reads as prepared from a
+    repair it does not use, and a hand-made repair is not lost. Returns the new names."""
+    n = 1
+    while True:
+        tag = "clean-unused" + ("" if n == 1 else "-%d" % n)
+        pairs = [("clean.png", tag + ".png"), ("clean-review.jpg", tag + "-review.jpg")]
+        if not any(os.path.exists(os.path.join(job, b)) for _, b in pairs):
+            break
+        n += 1
+    done = []
+    for a, b in pairs:
+        if os.path.exists(os.path.join(job, a)):
+            os.replace(os.path.join(job, a), os.path.join(job, b))
+            done.append(b)
+    return done
+
+
+def watermark_summary(wm, job):
+    """The watermark step for new's JSON."""
+    out = {"search": wm["search"]}
+    if wm["search"] == "removed":
+        out.update({"pill": (wm.get("pill") or {}).get("rect"), "mode": (wm.get("pill") or {}).get("mode"),
+                    "line": (wm.get("line") or {}).get("rect"), "clean": os.path.join(job, "clean.png"),
+                    "review": os.path.join(job, "clean-review.jpg")})
+    elif wm.get("detail"):
+        out["detail"] = wm["detail"]
+    return out
+
+
+def cmd_new(argv):
+    ap = argparse.ArgumentParser(prog="living-picture new",
+                                 description="Start a job folder for one picture: remove a share-platform watermark if one is "
+                                             "found (pictures up to %d px on the longer side are searched; the picture itself is "
+                                             "never changed), prepare the working copy (work/picture.png), draw the grid view "
+                                             "(look.jpg) and write a notes.md skeleton with the headings SKILL.md asks for, beginning "
+                                             "with the picture's path and sha256. It claims the folder before preparing anything and "
+                                             "never changes a folder that already holds a job (only --reprepare, for the same picture "
+                                             "at the same size). The job folder must stay out of git repositories and published "
+                                             "folders (SKILL.md), so it refuses those unless --force." % WATERMARK_MAX_SIDE)
+    ap.add_argument("image", help="the picture")
+    ap.add_argument("--job", help="job folder (default: ./<picture name>)")
+    ap.add_argument("--max", type=int, help="cap for the working copy's longer side (prepare --max; default 1600, "
+                                            "or the job's own size with --reprepare)")
+    ap.add_argument("--force", action="store_true",
+                    help="allow a job folder inside a git repository or inside the skill folder; it never overrides an existing job")
+    ap.add_argument("--reprepare", action="store_true",
+                    help="redo work/picture.png and look.jpg of an existing job, for example after the tools changed or after "
+                         "redoing clean.png by hand: only for the picture its notes.md names (same sha256) and only at the same "
+                         "working size, because plan.json, scene.json and the layers refer to that pixel grid. It prepares from "
+                         "the job's clean.png when there is one (the watermark repair, automatic or by hand), else from the "
+                         "picture, never searches for a watermark itself, and adds a line to notes.md")
+    ap.add_argument("--keep-watermark", action="store_true",
+                    help="do not look for a share-platform watermark (by default new looks in the lower right for a logo pill "
+                         "with an ID line under it, removes it with picture.py dewatermark into clean.png and prepares from "
+                         "that). With --reprepare: prepare from the picture as received even if the job has a clean.png, "
+                         "which is then renamed clean-unused.png")
+    a = ap.parse_args(argv)
+    image = os.path.abspath(os.path.expanduser(a.image))
+    if not os.path.isfile(image):
+        die("no such picture: %s" % image)
+    stem = re.sub(r"\s+", "-", os.path.splitext(os.path.basename(image))[0]).strip("-") or "picture"
+    job = os.path.abspath(os.path.expanduser(a.job or stem))
+    if os.path.exists(job) and not os.path.isdir(job):
+        die("%s exists and is not a folder" % job)
+    problems = []
+    repo = git_root(job)
+    if repo:
+        problems.append("%s is inside the git repository %s (SKILL.md keeps the picture and everything cut from it out of "
+                        "version control unless the person agrees)" % (job, repo))
+    if inside(job, ROOT):
+        problems.append("%s is inside the skill folder" % job)
+    if problems and not a.force:
+        die("; ".join(problems) + ". Choose another --job, or pass --force if this is intended.")
+    sha = sha256(image)
+    st = job_state(job)
+    if st and not a.reprepare:
+        if st["pending"]:
+            die(held_message(job, st, sha) + ". Nothing was changed.")
+        die(held_message(job, st, sha) + ". Nothing was changed. Continue that job%s, or choose another --job." % (
+            " (or redo its working copy with --reprepare)" if st["sha256"] == sha else " only if it is yours"))
+    if a.reprepare and not st:
+        die("%s holds no job to re-prepare (no notes.md or work/picture.png); drop --reprepare to start one" % job)
+    if a.reprepare and (st["pending"] or st["sha256"] != sha):
+        die(held_message(job, st, sha) + ". --reprepare only redoes the working copy of a job for this same picture.")
+    warnings = []
+    for d in (os.path.join(HOME, "Library", "Mobile Documents"), os.path.join(HOME, "Library", "CloudStorage")):
+        if inside(job, d):
+            warnings.append("the job folder is inside %s: a sync service will upload what is written there" % tilde(d))
+    for d in (os.path.join(HOME, "Desktop"), os.path.join(HOME, "Documents")):
+        if inside(job, d):
+            warnings.append("the job folder is inside %s: if iCloud 'Desktop & Documents Folders' is on, it is uploaded to iCloud" % tilde(d))
+    lp = os.path.join(ROOT, "bin", NAME)
+    pic, look_jpg, notes = os.path.join(job, "work", "picture.png"), os.path.join(job, "look.jpg"), os.path.join(job, "notes.md")
+    clean, review = os.path.join(job, "clean.png"), os.path.join(job, "clean-review.jpg")
+
+    if a.reprepare:
+        # The repair to use is the job's own clean.png, made by new or by hand with dewatermark; searching again here
+        # would overwrite a hand-made repair and could undo a mark kept on purpose.
+        old = st["size"]
+        has_clean = os.path.isfile(clean)
+        if st["prepared_from"] == "clean.png" and not has_clean and not a.keep_watermark:
+            die("notes.md says work/picture.png was prepared from clean.png (the picture with a share-platform watermark "
+                "removed), but %s is gone. Nothing was changed. Make it again (%s dewatermark %s --out %s, then check %s) "
+                "and run this again, or pass --keep-watermark to prepare from the picture as received, mark and all."
+                % (clean, q(lp), q(image), q(clean), review))
+        source = clean if has_clean and not a.keep_watermark else image
+        tmp, prep, look, _ = prepare_into(job, image, a.max or (max(old) if old else None),  # by default the job's own size
+                                          source=source)
+        try:
+            new = list(prep["size"])
+            if old and new != list(old):
+                die("re-preparing gives %d×%d px, but this job's working picture is %d×%d px, and %s refer to that pixel grid. "
+                    "Nothing was changed. A different working size needs a new job folder."
+                    % (new[0], new[1], old[0], old[1], ", ".join(on_grid(job)) or "its notes.md"))
+            changed = not (os.path.exists(pic) and filecmp.cmp(pic, prep["picture"], shallow=False))
+            move_in(tmp, job)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            aside = set_aside(job) if a.keep_watermark else []  # also a review sheet left from a deleted clean.png
+        except OSError as e:
+            aside = []
+            warnings.append("could not rename clean.png out of the way (%s): the next --reprepare would use it again; "
+                            "rename it yourself" % e)
+        stale =[n for n in ("work/layers", "work/review", "out") if os.path.exists(os.path.join(job, n))]
+        if changed and stale:
+            warnings.append("work/picture.png changed at the same size: %s were made from the previous copy; re-run cut, "
+                            "bundle and the checks" % ", ".join(stale))
+        date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        if source == clean:
+            line = "- 重新准备（%s，living-picture new --reprepare）：工作图由 clean.png 准备（sha256 %s…）；像素%s。\n" % (
+                date, sha256(clean, 12), "有变化" if changed else "未变")
+        else:
+            line = "- 重新准备（%s，living-picture new --reprepare%s）：工作图由原图准备；像素%s%s。\n" % (
+                date, " --keep-watermark" if a.keep_watermark else "", "有变化" if changed else "未变",
+                "；clean.png 改名为 %s，不再使用" % "、".join(aside) if aside else "")
+        try:
+            with open(notes, encoding="utf-8") as f:
+                text = f.read()
+            write_text(notes, add_to_section(text, "资产处理", line))
+            added = line.strip()
+        except (OSError, ValueError) as e:
+            warnings.append("could not add the re-prepare to notes.md (%s): record it there yourself" % e)
+            added = None
+        s = prep.get("scale_from_source") or 1
+        print(json.dumps({"job": job, "picture": pic, "size": new, "scale_from_source": s, "look": look_jpg,
+                          "grid_every": look.get("grid_every"), "notes": notes, "notes_written": False, "notes_added": added,
+                          "reprepared": True, "changed": changed, "prepared_from": source,
+                          "watermark_removed": source == clean,
+                          "watermark": {"search": "not run: --reprepare prepares from the job's clean.png when there is one, "
+                                                  "else from the picture", "set_aside": aside},
+                          "warnings": warnings,
+                          "next": ["look at %s" % look_jpg] +
+                                  (["check the watermark repair: %s (before | after | repaired) at display size and 4x" % review]
+                                   if source == clean and os.path.exists(review) else []) +
+                                  (["re-run cut, bundle and the checks: the working copy's pixels changed"] if changed else []) +
+                                  ["add to notes.md why it was re-prepared (a line was added under 资产处理)"]},
+                         ensure_ascii=False))
+        return 0
+
+    created = not os.path.isdir(job)
+    os.makedirs(job, exist_ok=True)
+    try:
+        fd = os.open(notes, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        st = job_state(job)
+        die((held_message(job, st, sha) if st else "another run claimed %s a moment ago" % job) +
+            ". Nothing was changed; choose another --job.")
+    date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(NOTES_PENDING.format(stem=stem, mark=PENDING, date=date, source=image, sha=sha))
+    done = moved = False
+    try:
+        tmp, prep, look, wm = prepare_into(job, image, a.max, search=not a.keep_watermark)
+        wm = wm or {"search": "kept"}
+        try:
+            move_in(tmp, job)
+            moved = True
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        w, h = prep["size"]
+        s = prep.get("scale_from_source") or 1
+        text = NOTES.format(stem=stem, source=image, sha=sha, bytes=os.path.getsize(image),
+                            source_size="；原图约 %d×%d px" % (round(w / s), round(h / s)),
+                            date=date, w=w, h=h, scale=round(s, 4), skill=ROOT, fingerprint=skill_fingerprint())
+        with open(notes, "w", encoding="utf-8") as f:  # still the placeholder this run created above
+            f.write(add_to_section(text, "资产处理", watermark_note(wm)))
+        done = True
+    finally:
+        if not done:  # give the folder back: a failed run must not leave a half job that blocks the next one
+            for p in ([pic, look_jpg, clean, review] if moved else []) + [notes]:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            if created:
+                for d in (os.path.join(job, "work"), job):
+                    try:
+                        os.rmdir(d)  # only when empty
+                    except OSError:
+                        pass
+    if wm["search"] == "failed":
+        warnings.append("the watermark search failed, so the picture was prepared as received: %s" % wm["detail"])
+    by_hand = ("if look.jpg shows a share-platform mark in the lower right: %s dewatermark %s --out %s (rough --pill/--line "
+               "boxes if it is not found), check %s, then %s new %s --job %s --reprepare"
+               % (q(lp), q(image), q(clean), review, q(lp), q(image), q(job)))
+    print(json.dumps({"job": job, "picture": pic, "size": [w, h], "scale_from_source": s, "look": look_jpg,
+                      "grid_every": look.get("grid_every"), "notes": notes, "notes_written": True, "warnings": warnings,
+                      "watermark_removed": wm["search"] == "removed", "watermark": watermark_summary(wm, job),
+                      "next": (["check the watermark repair: %s (before | after | repaired) at display size and 4x" % review]
+                               if wm["search"] == "removed" else []) +
+                              ["look at %s (and zoom with: %s look %s --box X0 Y0 X1 Y1)" % (look_jpg, q(lp), q(pic))] +
+                              ([by_hand] if wm["search"] in ("skipped", "failed") else []) +
+                              ["write the picture's intent and reading into notes.md (SKILL.md rules 1-2)",
+                               "write %s, then: %s cut %s" % (os.path.join(job, "plan.json"), q(lp), q(os.path.join(job, "plan.json")))]},
+                     ensure_ascii=False))
+    return 0
+
+
+def cmd_paths(argv):
+    if argv and argv[0] in ("-h", "--help"):
+        print("usage: living-picture paths\n\nPrint where the skill's files are, as JSON.")
+        return 0
+    j = lambda *p: os.path.join(ROOT, *p)  # noqa: E731
+    print(json.dumps({"skill": ROOT, "skill_md": j("SKILL.md"), "references": j("references"),
+                      "invocation": j("references", "invocation.md"), "cli": os.path.realpath(__file__),
+                      "picture_py": PICTURE, "capture": CAPTURE, "codex_bridge": BRIDGE,
+                      "install": j("scripts", "install.sh"), "workflow": j("workflows", "living-picture-batch.js"),
+                      "example": j("examples", "night-house"), "helper_cache": CACHE}, ensure_ascii=False))
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        sys.stdout.write(usage())
+        return 0 if argv else 1
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "help":
+        if not rest:
+            sys.stdout.write(usage())
+            return 0
+        cmd, rest = rest[0], ["--help"]
+    if cmd not in OWN and cmd in [n for n, _ in picture_commands()]:
+        exec_([tools_python()[0], PICTURE, cmd] + rest)
+    if cmd == "capture":
+        node = find_node()
+        if not node:
+            die("node not found: capture needs Node 22+ (brew install node), or set LIVING_PICTURE_NODE")
+        exec_([node, CAPTURE] + rest)
+    if cmd == "codex":
+        exec_([sys.executable, BRIDGE] + rest)
+    if cmd == "doctor":
+        return cmd_doctor(rest)
+    if cmd == "new":
+        return cmd_new(rest)
+    if cmd == "paths":
+        return cmd_paths(rest)
+    if cmd == "vision":
+        die("this copy of picture.py has no vision command (the macOS Vision helper is not part of it)")
+    die("unknown command %r (living-picture --help lists them)" % cmd)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
