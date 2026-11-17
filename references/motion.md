@@ -87,7 +87,8 @@ One shared wind field may drive the scene. Breeze can be zero; use continuous wi
 - `breeze`: the constant background (0.1 to 0.2 is a calm day).
 - `gust.strength`: 0.3 to 0.6 a stir, 0.6 to 0.9 a real gust, above 1 a storm. Match the weather of the picture.
 - `gust.speed`: picture-widths per second that a front travels. `gust.length`: how long it blows at a place. `gust.first`: when the first one comes. `"gust": false` leaves only the breeze.
-- `pointer`: a pointer swept quickly across the picture makes a local puff, like someone walking past (0 disables).
+- `pointer`: a pointer swept quickly across the picture makes a local puff, like someone walking past (0 disables). Puffs add to whatever gust is blowing and no layer has a cap of its own, so a strong pointer gain can push cloth past the reveal you prepared.
+- A touch or click: with no `"tap"` at the top of the scene, every tap is a 0.9-strength puff, with no throttle. Set `"tap": "none"`, `"tap": "ripple"`, or write `poke(world, x, y, LP)` in hooks for a gentler or throttled answer. Verify taps and sweeps explicitly (`capture.mjs --tap "t,x,y"`, `--puff "t,x,y,dx,dy"` at the strength a fast sweep reaches): `--pointer corners` only sets the view and never makes a puff, and seeked captures run without the live pointer handler.
 - `opening`: for a picture painted in the middle of a gust (a skirt blown sideways, a bent tree, streaming hair). `"opening": {"strength": 0.8, "length": 2.2}` starts the film with that gust already blowing everywhere, then lets it die away; later gusts arrive as usual. Pair it with `painted` on the things it holds (section 4), so that they are in their painted pose while it blows and relax when it drops. Without this, a wind-blown picture would sit frozen until the first gust travelled in, and its cloth would never hang.
 
 Anything can read the wind: `sway` does by default; a channel of type `wind` gives a creature or a custom effect its own reading.
@@ -166,7 +167,7 @@ A **channel** is a named number that says what something is doing right now: how
 | `osc` | breathing: in a little faster than out, period re-drawn each breath. | `period`, `amp`, `inhale` |
 | `wind` | the wind at a place, felt through a spring. | `at`, `gain`, `freq`, `damp`, `axis` (`"x"`, `"y"`, `"abs"`) |
 | `pointer` | notices the visitor: -1..1 toward the pointer, 0 when none. | `at`, `radius`, `amp`, `axis` |
-| `noise` | slow aimless variation. | `rate`, `amp` |
+| `noise` | slow aimless variation. `rate` is random knots per second, not Hz: a smooth noise at rate 1.3 undulates mostly below 0.7 Hz, so a flicker needs a rate several times the frequency you want. Measure with `capture.mjs --channels`. | `rate`, `amp` |
 | `const` | a fixed `value`. | |
 
 Any channel may add others (`"plus": "name"` or a list) and be scaled by one (`"times": "name"`). Define a channel before the ones that refer to it.

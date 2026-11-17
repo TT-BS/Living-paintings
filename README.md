@@ -87,7 +87,7 @@ scripts/install.sh --apply --with-cli  # 执行
 `living-picture` 是所有工具的统一入口，每个命令都有 `--help`，输出 JSON：
 
 ```bash
-living-picture new ~/Pictures/garden.jpg --job ~/LivingPictures/garden   # 建工作目录：去平台水印、准备工作图、网格图、notes.md
+living-picture new ~/Pictures/garden.jpg --job ~/LivingPictures/garden   # 建工作目录：去平台水印、拉正作品照片、准备工作图、网格图、notes.md
 living-picture vision ~/LivingPictures/garden/work/picture.png --out ~/LivingPictures/garden/work/vision   # 仅 Mac：识别起点
 living-picture cut ~/LivingPictures/garden/plan.json                     # 按计划切层、补底，写审查图
 living-picture bundle ~/LivingPictures/garden/scene.json --out ~/LivingPictures/garden/out   # 打包播放器
@@ -95,7 +95,7 @@ living-picture capture ~/LivingPictures/garden/out/index.html --out ~/LivingPict
 living-picture capture ~/LivingPictures/garden/out/index.html --out ~/LivingPictures/garden/video --video 20                 # 录 20 秒视频
 ```
 
-`plan.json`（怎么切层）和 `scene.json`（怎么动）通常由代理根据读画来写；格式和完整词汇见 `references/cutting.md` 与 `references/motion.md`。其他工具：`look`（带刻度网格看图）、`measure`（量边界、眼睛、轮廓）、`palette`（取色）、`inspect`（逐层或逐件检查）、`sheet`（帧条、节奏图）、`diff`、`dewatermark`、`paths`。
+`plan.json`（怎么切层）和 `scene.json`（怎么动）通常由代理根据读画来写；格式和完整词汇见 `references/cutting.md` 与 `references/motion.md`。其他工具：`look`（带刻度网格看图）、`measure`（量边界、眼睛、轮廓）、`palette`（取色）、`inspect`（逐层或逐件检查）、`sheet`（帧条、节奏图）、`diff`、`dewatermark`、`rectify`（拉正作品照片）、`paths`。
 
 ### 一次处理多幅画
 
@@ -130,6 +130,36 @@ fetch('art/scene.json').then(r => r.json()).then(scene => {
 - “更静一点”“再活一点点”“风慢一点”“阵风再少些”
 - “景深再多一点”“镜头别晃”
 - “花瓣太刻意了”“猫别眨眼了”
+
+## 随手拍就行
+
+不需要扫描仪。用手机对着墙上、桌上或手里的画拍一张，`living-picture new` 会在开始之前：
+
+- **找出作品**：裁掉墙、桌面、手和画框（Mac 上先用系统的 Vision，再按照片自身的边细化）；
+- **拉正**：校正斜拍造成的透视和镜头的轻微弯曲，按相机焦距还原作品原本的长宽比；
+- **校光和色**：台灯造成的一边亮一边暗、暖光或阴天的偏色，只有在画里有白纸边、卡纸，或画外有接近白色或灰色的墙面可作参照时才校正；没有参照就原样保留并写明。画本身的冷暖和明暗渐变不动，不锐化、不加饱和。
+
+已经是平整扫描或截图的图会原样通过。校正结果是工作目录里的 `rectified.png`，对比图 `rectified-review.jpg` 并排给出原照片和找到的边界、校正结果、光和色改了哪里。边界找错时告诉代理，或者自己用 `--corners` 给出四角重做；不想校正时加 `--as-is`。
+
+这个功能还新，以下情况容易出错：
+- 两幅画并排；
+- 浅色或白色画框；
+- 米色、浅蓝的卡纸，米色或桃色的墙；
+- 砖墙、网格切割垫这类花纹背景；
+- 在相册里裁成只剩作品、但还带着相机信息的图。
+
+代理会按对比图逐条核对（清单在 `references/photo.md`）；拿不准时，按原照片处理也完全可以。
+
+**拍的时候注意这几点，效果最好：**
+
+- 整幅作品都在画面里，四周留一圈墙或桌面：被照片边缘裁掉的部分补不回来。
+- 尽量正对作品，作品占画面的大半。斜一点没关系，但太斜或太小会损失细节，工具会提示。
+- 避开反光：油画和带玻璃的画框从侧面打光，不用闪光灯，手机稍微侧一点让反光落到画外。反光处的颜色无法还原。
+- 光线尽量均匀，避免影子横过画面；作品旁边露出一点白墙或白纸，能让光和颜色校得更准。
+- 拿稳手机，点一下画面对焦。
+- 用原图：通过隔空投送或数据线传过来；聊天软件压缩过的图丢细节，也没有焦距信息。
+
+工具给出的提示（反光、模糊、角度太斜、作品被裁掉、像素太少）通常意味着重拍一张更好。
 
 ## 去掉分享平台的水印
 
@@ -169,6 +199,9 @@ fetch('art/scene.json').then(r => r.json()).then(scene => {
 **没有 Chrome？**
 装 Chrome、Chromium 或 Edge 任意一个，或用 `CHROME_PATH` 指定浏览器路径。
 
+**照片拉正后边界不对，或者颜色变了？**
+看工作目录里的 `rectified-review.jpg`，把问题告诉代理。它会从网格图读出作品的四角，用 `rectify --corners` 重做；校正反而更糟时，用 `living-picture new … --reprepare --as-is` 改回按原照片准备。背景是米色墙或木桌时，偏色校正可能不准，可以让代理用 `rectify --color off` 重做。
+
 **画面里某个动作看起来不对？**
 直接告诉代理哪里不对、像什么。技能的原则是“宁可关掉一个动作，也不交一个错的”，坏边会回到切层或补底去修，而不是靠缩小幅度遮掩。
 
@@ -185,10 +218,11 @@ scripts/
   capture.mjs                用本机 Chrome 取帧、录视频
   install.sh                 用符号链接安装给 Claude Code、Codex 和终端
   codex_bridge.py            可选的 Codex 复审（需明确同意才发送）
-  lp/                        切层、补底、打包、测量、去水印、Apple 识别等实现
+  lp/                        切层、补底、打包、测量、去水印、照片拉正、Apple 识别等实现
   macos/                     按需编译的 Swift 小工具（Vision、ImageIO、AVFoundation）
 runtime/src/                 网页播放器源码，打包时拼成 living-picture.js
-references/                  读画、切层、运动词汇、检查、网页接入、安装与调用、Mac 功能
+references/                  读画、切层、运动词汇、检查（含常见失误清单）、照片拉正、网页接入、安装与调用、Mac 功能
+tests/photo/                 照片拉正的独立基准：模拟手机照片和真值，给校正打分
 workflows/                   多幅画并行处理的工作流
 examples/night-house/        一张脚本画出的小图的完整示例（plan、scene 都在）
 docs/                        说明用的图片
@@ -205,5 +239,7 @@ git clone https://github.com/TT-BS/Living-paintings.git ~/living-paintings
 ~/living-paintings/scripts/install.sh --apply --with-cli
 living-picture doctor
 ```
+
+A casual phone photo is fine: before animating, `living-picture new` finds the artwork, crops away the wall, frame or hands, corrects perspective and lens bending, and evens out light and colour casts only where it sees a neutral reference (a paper margin, a mat, a white or grey wall); a flat scan or screenshot passes unchanged. Check `rectified-review.jpg`; redo with `rectify --corners`, or skip with `--as-is`. Keep the whole work in the frame with some wall around it, avoid glare, and send the original file rather than a chat-compressed copy.
 
 Then ask your agent: "Bring this painting to life: ~/Pictures/garden.jpg". In Codex, use `$living-picture` or `/skills`. Requirements: Python 3.9+ with numpy, scipy and Pillow; Node 22+; Chrome, Chromium or Edge; optionally ffmpeg and, on macOS, the Xcode command line tools for Apple Vision, exact HEIC and camera RAW input, and AVFoundation video (without them, opaque HEIC and RAW pictures are converted with the built-in `sips`, and video falls back to AVFoundation whenever ffmpeg is missing or fails). See `SKILL.md` and `references/invocation.md` for the full workflow, the CLI and batch processing.

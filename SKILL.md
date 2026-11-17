@@ -38,12 +38,24 @@ compatibility: Needs Python 3.9+ with numpy, scipy and Pillow for the picture to
    ```
    bin/living-picture new <原图> --job <job>
    ```
-   它建工作目录、写 notes.md 骨架（原图路径与 sha256），自动去平台水印（见下），再 prepare 和 look。分步时：
+   它建工作目录、写 notes.md 骨架（原图路径与 sha256），自动去平台水印，把随手拍的作品照片拉正（都见下），再 prepare 和 look。分步时：
    ```
    python3 scripts/picture.py prepare <原图> --out <job>/work
    python3 scripts/picture.py look <job>/work/picture.png --out <job>/look.jpg
    ```
    平台水印（小红书等，右下角的药丸标志和其下右对齐的 ID 文字）：`new` 会自动处理，`--keep-watermark` 关掉；分步时先 `python3 scripts/picture.py dewatermark <原图> --out <job>/clean.png`，再用 clean.png 去 prepare。两者都在才动手，画家签名不会被当成水印；在平坦的底上反推还原框下的画，在纹理密的底上用周围颜料重画，并补回颗粒。看它写出的对比图（原图｜修复后｜改动处），在显示尺寸和 4 倍下核对。找不到时给 `--pill x0 y0 x1 y1 --line x0 y0 x1 y1` 粗框。原件不改。
+   随手拍的作品照片（不需要专业扫描）：`new` 在去水印之后运行 `picture.py rectify`。它找出作品的边界（Mac 上先用 Vision，再按照片自身的边细化），裁掉墙、桌面、手和画框，校正透视和镜头弯曲。只有画里有纸边、卡纸，或画外有接近中性的墙面可作参照时，才把不均匀的光和偏色校正掉；没有参照就原样保留并写明。画自己的冷暖和明暗渐变不动，不锐化、不加饱和。已经是平整扫描或截图的图原样通过。校正后先看 `rectified-review.jpg`（照片和找到的边界｜校正结果｜光和色改了哪里、改了多少），在显示尺寸下核对四角、边是否直、颜色是否还像这幅画。边界错了，或作品被照片边缘裁掉、没找到边界时，从 look.jpg 读出四角，按 `new` 打印的命令用 `rectify --corners "x,y;x,y;x,y;x,y"` 重做，再 `new … --reprepare`；校正反而更糟时用 `--reprepare --as-is`。它报的警告（反光、模糊、角度太斜、作品被裁掉、像素太少）多半意味着重拍更好，照实转告使用者，不要靠后续步骤掩盖。它目前最常见的错法，看对比图时逐条排除：
+   - 把画里的窗、门或画中画框当成边界，裁掉大半幅画（文件带相机信息时尤甚，比如在相册里裁过的照片）；
+   - 两幅并排的画被当成一幅；
+   - 画框被留下，浅色木框、白框被当成纸边并拿来校白，整幅画偏蓝；
+   - 米色、浅蓝的卡纸或米色、桃色的墙被当成中性色，画被反向偏色；
+   - 灰卡纸被映射成纸白，整幅提亮到 1.6 倍；
+   - 没有纸边的浅色画，自己的明暗渐变被当成光照抹平；
+   - 硬影子没去掉，反而在中间造出一块亮斑；
+   - 没找到边界（`quad.corners` 为空）却仍按墙面给整张照片校了色；
+   - 砖墙、网格切割垫上，背景线被当成边。
+
+   JSON 里 `gains` 或 `exposure` 明显偏离 1，而参照是卡纸、画框或墙时尤其要怀疑。每种的识别办法和对策见 `references/photo.md` 的 Known failure modes。
    在 Mac 上，`python3 scripts/picture.py vision <job>/work/picture.png --out <job>/work/vision` 用系统自带的 Vision 给出起点：主体与人物遮罩（可直接作 mask 选区）、脸与眼（现成的头部转动和眨眼条目）、肢体转轴、视觉焦点、文字与签名（固定层候选）。先看它的 `review.jpg`，每一条都核对后再用；见 `references/macos-vision.md`。
    `prepare` 把原图重新编码成 `work/picture.png`（去掉元数据、规范方向和色彩、保留透明度；iPhone 的 HEIC 和广色域照片也能直接读）；之后所有坐标都指这张图的像素。`look` 在全图或局部（`--box x0 y0 x1 y1`）上画带刻度的网格，定轮廓前先放大核对。量边界、眼睛和颜色用 `measure`（逐行区段、色块中心与现成的眨眼 mask、带余量的外轮廓）和 `palette`（点取色、区域主色），再用 `look --poly/--points` 画回去核对，不凭目测。
 
@@ -64,7 +76,7 @@ compatibility: Needs Python 3.9+ with numpy, scipy and Pillow for the picture to
    node scripts/capture.mjs <job>/out/index.html --out <job>/check-view --pointer corners:1-9 --every 0.5 --duration 10
    node scripts/capture.mjs <job>/out/index.html --out <job>/video --video 20
    ```
-   播放是确定的，同一秒总是同一帧。要近看的时刻先用 `capture.mjs … --every 0.1 --channels blink,tilt --track "layer:x,y"` 找出（通道峰值、位移最大处），再在那些时刻取高清帧。看事件全程的帧条、视角四个极端、每条会动的边和每张脸的放大（`sheet --box … --zoom …`）、一分钟左右的节奏图（`sheet --rhythm`），再看连续视频。`--reduced-motion --probe 3` 确认减少动态时不动。要看什么、每种失败长什么样，见 `references/checking.md`。修的时候修原因：坏边是切层或补底的问题，不是幅度的问题。宁可关掉一个动作，也不要交一个错的。
+   播放是确定的，同一秒总是同一帧。要近看的时刻先用 `capture.mjs … --every 0.1 --channels blink,tilt --track "layer:x,y"` 找出（通道峰值、位移最大处），再在那些时刻取高清帧。看事件全程的帧条、视角四个极端、每条会动的边和每张脸的放大（`sheet --box … --zoom …`）、一分钟左右的节奏图（`sheet --rhythm`），再看连续视频。`--reduced-motion --probe 3` 确认减少动态时不动。要看什么、每种失败长什么样，见 `references/checking.md`；交付前按它第 4 节（独立审查反复抓到的失误）逐条自查，最常见的是：移动层的外缘留在底板成旧轮廓、细尾和虚笔漏选、直线切口穿过运动物体、点击和划过把层推出补底范围、说明里的数字来自上一版。修的时候修原因：坏边是切层或补底的问题，不是幅度的问题。宁可关掉一个动作，也不要交一个错的。
 
 6. **交付。** 把 `out/site/` 放进项目，按 `references/embedding.md` 嵌入（容器里放原图作回退，一个脚本，一次调用）。播放器离屏自停、对要求减少动态的人显示原图、带暂停按钮，这些都要保留。告诉使用者：让什么活了、为什么，什么故意留着不动，哪里没做好；之后的修改用感觉的话来谈（更静、更活、更有景深、天气慢一点），由你翻译成参数。
 
@@ -82,6 +94,8 @@ compatibility: Needs Python 3.9+ with numpy, scipy and Pillow for the picture to
 | 文字和边稳 | 文字、签名、画框和画的边缘保持清晰，留在原处。 |
 | 仍是这幅画 | 没有外来的东西；每一帧里媒介仍像它自己。 |
 | 放出的东西成立 | 每个会离开原位的部件只含该物体、本体完整，颜色是颜料本色并与画中同类一致，在它经过的每种底上都成立；复制件看不出重复。 |
+| 经得起访客 | 真实点击和快速划过时，没有东西被推过准备好的补底范围；`--pointer corners` 和 seek 捕获都不产生阵风，要用 `--tap`、`--puff` 单独测。 |
+| 说的就是交付的 | 笔记、数字和录像都来自最终页面；改过就重测、重写、重录。 |
 
 ## 按问题找参考
 
@@ -89,6 +103,7 @@ compatibility: Needs Python 3.9+ with numpy, scipy and Pillow for the picture to
 |---|---|---|
 | 读图与关系描述库 | 规则 1–2；`references/reading.md` | 从画面证据建立关系，不由词库发明表情或事件 |
 | 平台水印（小红书等） | `picture.py dewatermark --help`；`scripts/lp/watermark.py` | 标志和 ID 文字同在才自动处理；修复不是复原，按对比图核对 |
+| 随手拍的作品照片（裁切、透视、镜头、光和色） | `picture.py rectify --help`；`references/photo.md` | 光和色只按中性参照校正，画自己的冷暖与渐变不动；先看 rectified-review.jpg，边界错了用 `--corners` 重做 |
 | Mac 上的识别起点（主体、脸与眼、肢体、焦点、文字） | `picture.py vision --help`；`references/macos-vision.md` | 每条都是起点：看 review.jpg，按原生尺寸核对后再粘进 plan 或 scene |
 | iPhone 照片、HEIC、相机 RAW、广色域；没装 ffmpeg 出视频 | `references/macos-media.md` | prepare 统一转成 sRGB 工作图（RAW 在 Mac 上用系统解码器冲洗）；出视频时 ffmpeg 缺失或坏掉会自动改用 AVFoundation，超过 4096 像素的边改用 HEVC |
 | 安装到 Claude Code 与 Codex、命令行、批量处理 | `bin/living-picture --help`、`doctor`；`references/invocation.md` | 一份正本，用符号链接安装；批量处理用 `workflows/living-picture-batch.js`；送图给 Codex 只在明确同意时 |
@@ -107,12 +122,13 @@ compatibility: Needs Python 3.9+ with numpy, scipy and Pillow for the picture to
 ## 文件
 
 - `bin/living-picture`：统一的命令行入口（`new`、`doctor`、`paths`、`capture`、`codex`，以及 picture.py 的全部命令）；`scripts/install.sh` 用符号链接把这一份装给 Claude Code、Codex（`~/.agents/skills`）和命令行，默认只预演
-- `scripts/picture.py`：`prepare`、`look`、`cut`、`bundle`、`diff`、`sheet`、`measure`、`palette`、`inspect`、`vision`、`dewatermark`（各有 `--help`）
+- `scripts/picture.py`：`prepare`、`look`、`cut`、`bundle`、`diff`、`sheet`、`measure`、`palette`、`inspect`、`vision`、`dewatermark`、`rectify`（各有 `--help`）
 - `scripts/capture.mjs`：从打包好的页面取帧和短视频（有 ffmpeg 用它，没有就用 AVFoundation）
-- `scripts/lp/`：切层、补底、打包等工具代码；`tools.py` 是测量与检查；`watermark.py` 去平台水印；`apple.py` 调用 Mac 自带的 Vision
+- `scripts/lp/`：切层、补底、打包等工具代码；`tools.py` 是测量与检查；`watermark.py` 去平台水印；`photo.py` 拉正拍摄的作品照片；`apple.py` 调用 Mac 自带的 Vision
+- `tests/photo/`：拍摄校正的独立基准（模拟手机照片与真值，`make_photos.py` 生成，`bench.py` 打分）
 - `scripts/macos/`：按需编译的 Swift 小工具（Vision 识别、ImageIO 读图、AVFoundation 出视频），缓存在 `~/Library/Caches/living-picture`
 - `scripts/codex_bridge.py`：可选的 Codex 独立复审与补底指引；不带 `--consent-upload` 什么都不发送
 - `workflows/living-picture-batch.js`：多张图并行的工作流（制作、独立审查、修复）
 - `runtime/src/`：播放器源码，`bundle` 时拼成 `living-picture.js`
-- `references/`：读画、切层、运动词汇、检查、网页接入、补底和安静段两份合同，以及 Mac 识别（`macos-vision.md`）、Mac 读图与出视频（`macos-media.md`）、安装与调用（`invocation.md`）
+- `references/`：读画、切层、运动词汇、检查、网页接入、补底和安静段两份合同，以及拍摄照片校正（`photo.md`）、Mac 识别（`macos-vision.md`）、Mac 读图与出视频（`macos-media.md`）、安装与调用（`invocation.md`）
 - `examples/night-house/`：一张用脚本画的小图的完整示例（`make_picture.py` 画图，附 plan 和 scene），用来看文件格式怎样跑通。它是一张画的答案，不是模板。

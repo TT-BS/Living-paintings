@@ -52,6 +52,10 @@ EXTRA_PATH = ("/opt/homebrew/bin", "/usr/local/bin")
 # search runs at full resolution: about 3 s and 0.15 GB per megapixel, 100 s and 2.4 GB on a 24 MP photo. So `new`
 # searches only pictures up to this longer side; `picture.py dewatermark` still searches any picture by hand.
 WATERMARK_MAX_SIDE = 2560
+# The photo correction (picture.py rectify) keeps the work at its own detail in the photo, never enlarged, up to this
+# longer side (rectify's default) or the job's own --max if that is larger; prepare caps the working copy afterwards.
+RECTIFY_MAX = 4096
+RECT, RECT_REVIEW = "rectified.png", "rectified-review.jpg"
 q = shlex.quote  # paths inside the commands that `new` suggests, so they paste intact
 
 
@@ -224,7 +228,8 @@ def usage():
     lines += ["", "Frames and video (scripts/capture.mjs; Node 22+ and Chrome, Chromium or Edge):",
               row("capture", "render frames, probes or a short video of a bundled page"), "",
               "Jobs and setup:",
-              row("new", "start a job folder for a picture: watermark check, prepare, look, notes.md (refuses inside git or over a job)"),
+              row("new", "start a job folder for a picture: watermark check, photo correction, prepare, look, notes.md "
+                         "(refuses inside git or over a job)"),
               row("doctor", "check Python packages, Node, browser, video, Xcode tools, Codex and installs"),
               row("paths", "where the skill's files are (JSON)"),
               row("help", "help CMD is CMD --help"), "",
@@ -475,7 +480,7 @@ NOTES = """# 工作笔记：{stem}
 - 建立：living-picture new，{date}
 
 ## 工作尺寸
-- work/picture.png：{w}×{h} px（相对原图缩放 {scale}）
+- work/picture.png：{w}×{h} px（{made}）
 
 ## 画意
 <!-- 一句话（规则 1）。 -->
@@ -620,13 +625,14 @@ def job_state(job):
     source = re.search(r"^- 原图：(.+)$", text, re.M)
     sha = re.search(r"^- sha256：([0-9a-f]{64})\s*$", text, re.M)
     size = png_size(pic)
-    if not size:
-        m = re.search(r"^- work/picture\.png：(\d+)×(\d+) px", text, re.M)
-        size = [int(m.group(1)), int(m.group(2))] if m else None
+    if not size:  # the last size noted: a re-prepare made before anything referred to the grid may have changed it
+        m = re.findall(r"^- work/picture\.png：(\d+)×(\d+) px", text, re.M)
+        size = [int(m[-1][0]), int(m[-1][1])] if m else None
     made = FROM.findall(text)  # the last "工作图由 … 准备" that new or --reprepare wrote
+    rec = RECT_FROM.findall(text)  # the last record of what rectified.png was corrected from
     return {"held": held, "source": source.group(1).strip() if source else None, "sha256": sha.group(1) if sha else None,
-            "pending": PENDING in text, "size": size,
-            "prepared_from": ("clean.png" if "clean" in made[-1] else "picture") if made else None}
+            "pending": PENDING in text, "size": size, "prepared_from": made_from(made[-1]) if made else None,
+            "rectified": (rec[-1][0], ORIGIN[rec[-1][1]]) if rec else None}
 
 
 def held_message(job, st, sha):
@@ -645,7 +651,7 @@ def held_message(job, st, sha):
 def on_grid(job):
     """Files of a job that refer to work/picture.png's pixel grid."""
     return sorted(os.path.basename(p) for p in glob.glob(os.path.join(job, "*.json"))) + \
-        [n for n in ("work/layers", "work/review", "out") if os.path.exists(os.path.join(job, n))]
+        [n for n in ("work/layers", "work/review", "work/vision", "out") if os.path.exists(os.path.join(job, n))]
 
 
 def find_watermark(image, tmp):
@@ -669,11 +675,39 @@ def find_watermark(image, tmp):
     return {"search": "failed", "detail": "picture.py dewatermark: %s%s" % (how, ": " + " | ".join(said[-3:]) if said else "")}
 
 
-def prepare_into(job, image, max_side, source=None, search=False):
+def correct_photo(src, tmp, max_side):
+    """Run picture.py rectify on src (the picture, or its watermark repair) into tmp. Returns its report with "run" set
+    to "corrected" (rectified.png and rectified-review.jpg are then in tmp), "nothing to correct" (its exit 4: a flat
+    scan or screenshot, or no artwork boundary found with confidence) or "failed": a crash, an out-of-memory kill or an
+    unreadable file is reported with the tool's last words, never taken for "nothing to correct"."""
+    py, _ = tools_python()
+    sys.stderr.write("living-picture new: looking for a photographed artwork to crop, straighten and even out "
+                     "(--as-is skips this) ...\n")
+    sys.stderr.flush()
+    out, sheet = os.path.join(tmp, RECT), os.path.join(tmp, RECT_REVIEW)
+    p = subprocess.run([py, PICTURE, "rectify", src, "--out", out, "--review", sheet, "--max", str(max_side)],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=ENV)
+    rep = last_json(p.stdout)
+    if p.returncode == 0 and rep.get("changed") and os.path.isfile(out):
+        return dict(rep, run="corrected")
+    for f in (out, sheet):             # exit 4 writes nothing; a run that failed may have left part of a file
+        if os.path.exists(f):
+            os.remove(f)
+    if p.returncode == 4 and rep.get("changed") is False:
+        return dict(rep, run="nothing to correct")
+    how = ("killed by signal %d%s" % (-p.returncode, " (out of memory?)" if p.returncode == -9 else "")
+           if p.returncode < 0 else "exit %d" % p.returncode)
+    said = [ln.strip()[:300] for ln in ("%s\n%s" % (rep.get("error") or "", p.stderr or "")).splitlines() if ln.strip()]
+    return {"run": "failed", "detail": "picture.py rectify: %s%s" % (how, ": " + " | ".join(said[-3:]) if said else "")}
+
+
+def prepare_into(job, image, max_side, source=None, search=False, rectify_max=None):
     """prepare + look into a fresh hidden folder inside the job, so nothing in place changes unless all succeed.
     It prepares `source` (default: the picture). With `search` it then looks for a share-platform watermark on the
-    picture, if the picture is no larger than platforms deliver, and prepares from the repaired copy when one was
-    removed. Returns (tmp, prepare report, look report, watermark report or None)."""
+    picture, if the picture is no larger than platforms deliver; with `rectify_max` it then runs the photo correction
+    (picture.py rectify, its output capped at that longer side) on the repaired copy or the picture. When either step
+    wrote a copy, it prepares again from the last one. Returns (tmp, prepare report, look report, watermark report or
+    None, rectify report or None, the picture's own [width, height])."""
     tmp = tempfile.mkdtemp(prefix=".living-picture-new-", dir=job)
     try:
         py, _ = tools_python()
@@ -681,11 +715,13 @@ def prepare_into(job, image, max_side, source=None, search=False):
         def prepare(src):
             return run_tool([py, PICTURE, "prepare", src, "--out", os.path.join(tmp, "work")] +
                             (["--max", str(max_side)] if max_side else []))
-        prep = prepare(source or image)
-        wm = None
+        first = src = source or image
+        prep = prepare(first)
+        # prepare reads every format the tools read, so its scale gives the picture's own size before the search
+        own = [int(round(v / (prep.get("scale_from_source") or 1))) for v in prep["size"]]
+        wm = rf = None
         if search:
-            # prepare reads every format the tools read, so its scale gives the picture's own size before the search
-            side = int(round(max(prep["size"]) / (prep.get("scale_from_source") or 1)))
+            side = max(own)
             if side > WATERMARK_MAX_SIDE:
                 wm = {"search": "skipped", "side": side,
                       "detail": "the picture is %d px on its longer side; share platforms deliver smaller pictures, so "
@@ -694,9 +730,16 @@ def prepare_into(job, image, max_side, source=None, search=False):
             else:
                 wm = find_watermark(image, tmp)
                 if wm["search"] == "removed":
-                    prep = prepare(os.path.join(tmp, "clean.png"))
+                    src = os.path.join(tmp, "clean.png")
+        if rectify_max:
+            # after the watermark step: a platform's mark belongs to the posted image's corner, not to the work
+            rf = correct_photo(src, tmp, rectify_max)
+            if rf["run"] == "corrected":
+                src = os.path.join(tmp, RECT)
+        if src != first:
+            prep = prepare(src)
         look = run_tool([py, PICTURE, "look", prep["picture"], "--out", os.path.join(tmp, "look.jpg")])
-        return tmp, prep, look, wm
+        return tmp, prep, look, wm, rf, own
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
@@ -709,42 +752,147 @@ def move_in(tmp, job):
     for n in os.listdir(os.path.join(tmp, "work")):
         os.replace(os.path.join(tmp, "work", n), os.path.join(work, n))
     os.replace(os.path.join(tmp, "look.jpg"), os.path.join(job, "look.jpg"))
-    for n in ("clean.png", "clean-review.jpg"):              # present only when a platform watermark was removed
+    # present only when a platform watermark was removed, or the photo corrected
+    for n in ("clean.png", "clean-review.jpg", RECT, RECT_REVIEW):
         if os.path.exists(os.path.join(tmp, n)):
             os.replace(os.path.join(tmp, n), os.path.join(job, n))
 
 
 # What notes.md records about the working copy's source; `--reprepare` reads the last one back.
-FROM = re.compile(r"工作图由(原图| ?clean\.png ?)准备")
-BY_HAND = "若右下角其实有平台水印：dewatermark 原图 --out clean.png（找不到时加 --pill/--line 粗框），核对 clean-review.jpg，再 new --reprepare。"
+FROM = re.compile(r"工作图由(原图| ?clean\.png ?| ?rectified\.png ?)准备")
+# What rectified.png was corrected from, with the start of its sha256: --reprepare trusts the record only while the
+# file is still that one (a copy redone by hand has none).
+RECT_FROM = re.compile(r"rectified\.png（sha256 ([0-9a-f]{12})…，(由原图校正|由 clean\.png 校正|来源未记录)）")
+ORIGIN = {"由原图校正": "picture", "由 clean.png 校正": "clean.png", "来源未记录": None}
+BY_HAND_RECT = ("若这其实是一张画的照片：rectify 原图（去过水印时用 clean.png）--out rectified.png --corners \"x,y;x,y;x,y;x,y\"，"
+                "核对 rectified-review.jpg，再 new --reprepare。")
 
 
-def watermark_note(wm):
-    """The 资产处理 line of a new job: what the watermark step did and what work/picture.png was prepared from."""
+def made_from(phrase):
+    return RECT if "rectified" in phrase else "clean.png" if "clean" in phrase else "picture"
+
+
+def from_phrase(name):
+    """notes.md's "工作图由 … 准备" for a source: "picture", "clean.png" or "rectified.png"."""
+    return "工作图由原图准备" if name == "picture" else "工作图由 %s 准备" % name
+
+
+def rect_record(sha12, origin):
+    return "rectified.png（sha256 %s…，%s）" % (sha12, {v: k for k, v in ORIGIN.items()}[origin])
+
+
+def size_note(name, s):
+    """notes.md's 工作尺寸 detail: what work/picture.png was prepared from and at what scale."""
+    return ("由 rectified.png 准备，相对它缩放 %s" if name == RECT else "相对原图缩放 %s") % round(s, 4)
+
+
+def by_hand_watermark(corrected):
+    return ("若右下角其实有平台水印：dewatermark 原图 --out clean.png（找不到时加 --pill/--line 粗框），核对 clean-review.jpg，"
+            "%s再 new --reprepare。" % ("再 rectify clean.png --out rectified.png 并核对 rectified-review.jpg（照片校正要基于"
+                                       "修复后的图），" if corrected else ""))
+
+
+def watermark_note(wm, corrected=False):
+    """The 资产处理 line of a new job about the watermark step (the photo-correction line after it ends with what
+    work/picture.png was prepared from)."""
     s = wm["search"]
     if s == "removed":
         p = wm.get("pill") or {}
         how = {"untint": "反推还原", "fill": "按周围颜料重画", "hybrid": "混合"}.get(p.get("mode"), p.get("mode"))
-        return ("- 平台水印：living-picture new 已自动去除（picture.py dewatermark，标志框 %s，%s；ID 行 %s）。原件未改；"
-                "工作图由 clean.png 准备；对比图 clean-review.jpg 需在显示尺寸和 4 倍下核对。\n"
+        return ("- 平台水印：living-picture new 已自动去除（picture.py dewatermark，标志框 %s，%s；ID 行 %s），修复后的图是 "
+                "clean.png；原件未改；对比图 clean-review.jpg 需在显示尺寸和 4 倍下核对。\n"
                 % (p.get("rect"), how, (wm.get("line") or {}).get("rect")))
     if s == "kept":
-        return "- 平台水印：未查找（--keep-watermark）。工作图由原图准备。\n"
+        return "- 平台水印：未查找（--keep-watermark）。\n"
     if s == "none found":
-        return "- 平台水印：living-picture new 在右下角没有找到（picture.py dewatermark）。工作图由原图准备。\n"
+        return "- 平台水印：living-picture new 在右下角没有找到（picture.py dewatermark）。\n"
     if s == "skipped":
-        return ("- 平台水印：未查找：原图长边 %d px，大于平台下载图（%d px 以内才自动查找，全尺寸查找很慢）。工作图由原图准备。%s\n"
-                % (wm["side"], WATERMARK_MAX_SIDE, BY_HAND))
-    return "- 平台水印：查找失败（%s）。工作图由原图准备。%s\n" % (wm["detail"], BY_HAND)
+        return ("- 平台水印：未查找：原图长边 %d px，大于平台下载图（%d px 以内才自动查找，全尺寸查找很慢）。%s\n"
+                % (wm["side"], WATERMARK_MAX_SIDE, by_hand_watermark(corrected)))
+    return "- 平台水印：查找失败（%s）。%s\n" % (wm["detail"], by_hand_watermark(corrected))
 
 
-def set_aside(job):
-    """Rename clean.png and clean-review.jpg to clean-unused[-N]…, so the job no longer reads as prepared from a
-    repair it does not use, and a hand-made repair is not lost. Returns the new names."""
+FOCAL = {"exif": "焦距取自 EXIF", "vanishing points": "焦距由消失点推得", None: "按对边长度"}
+REFERENCE = {"margin": "纸边或卡纸", "surround": "画外的墙面或桌面"}
+
+
+def corrections(rf):
+    """What rectify changed, as (English keys for the JSON, Chinese phrases for notes.md), and what it left as
+    photographed and why (Chinese)."""
+    did, zh, left = [], [], []
+    pct = lambda v: "?" if v is None else "%d%%" % round(100 * v)  # noqa: E731
+    if (rf.get("frame") or {}).get("removed"):
+        did.append("frame or mat removed")
+        zh.append("去掉画框或卡纸")
+    pe = rf.get("perspective") or {}
+    if pe.get("applied"):
+        f = pe.get("focal")
+        did.append("cropped and perspective corrected")
+        zh.append("裁出画并校正透视（倾斜约 %s°，宽高比 %s，%s）" % (
+            pe.get("tilt_deg"), pe.get("aspect"),
+            "假定手机主摄（%s）" % f.replace("assumed ", "") if str(f).startswith("assumed") else FOCAL.get(f, f)))
+    le = rf.get("lens") or {}
+    if le.get("applied"):
+        did.append("lens distortion")
+        zh.append("镜头畸变（k1 %s）" % le.get("k1"))
+    li = rf.get("light") or {}
+    if li.get("applied"):
+        did.append("light evened out")
+        zh.append("按%s匀平光照（不均 %s → %s）" % (REFERENCE.get(li.get("reference"), li.get("reference")),
+                                             pct(li.get("variation_before")), pct(li.get("variation_after"))))
+    elif li.get("why"):
+        left.append("光照（%s）" % li["why"])
+    co = rf.get("color") or {}
+    if co.get("applied"):
+        did.append("colour cast removed")
+        zh.append("按%s去掉色偏（增益 r/g/b %s）" % (REFERENCE.get(co.get("reference"), co.get("reference")),
+                                              "/".join("%.2f" % g for g in co.get("gains") or [])))
+    elif co.get("why"):
+        left.append("颜色（%s）" % co["why"])
+    if rf.get("exposure"):
+        did.append("exposure")
+        zh.append("曝光 ×%.2f" % rf["exposure"])
+    return did, zh, left
+
+
+def rectify_note(rf, rect_in, sha12=None):
+    """The 资产处理 lines of a new job about the photo correction, ending with what work/picture.png was prepared
+    from. rect_in is what rectify ran on: "picture" or "clean.png"."""
+    r = rf["run"]
+    end = from_phrase(RECT if r == "corrected" else rect_in) + "。"
+    warns = ["  - 警告：%s" % w for w in rf.get("warnings") or []]
+    if r == "skipped":
+        return "- 照片校正：未运行（--as-is）。%s\n" % end
+    if r == "failed":
+        return "- 照片校正：picture.py rectify 失败（%s）。%s%s\n" % (rf["detail"], end, BY_HAND_RECT)
+    if r == "nothing to correct":
+        return "\n".join(["- 照片校正：picture.py rectify 没有改动（%s）。%s%s" % (
+            rf.get("note") or "exit 4", end, BY_HAND_RECT if warns else "")] + warns) + "\n"
+    src = "原图" if rect_in == "picture" else "clean.png"
+    qd, fr = rf.get("quad") or {}, rf.get("frame") or {}
+    _, zh, left = corrections(rf)
+    lines = ["- 照片校正：living-picture new 用 picture.py rectify 校正了%s（原件未改），得到 %s，%s px。" % (
+                 src, rect_record(sha12, rect_in), "×".join(str(v) for v in rf.get("size_out") or ["?", "?"])),
+             "  - 边界：四角 %s（%s的像素，左上、右上、右下、左下；来源 %s，置信 %s）%s。" % (
+                 json.dumps(qd.get("corners")), src, qd.get("source"), qd.get("confidence"),
+                 "；找到画框或卡纸并去掉" if fr.get("removed") else "；找到画框或卡纸，保留" if fr.get("found") else ""),
+             "  - 改了：%s。" % ("；".join(zh) or "无")]
+    if left:
+        lines.append("  - 没改：%s。" % "；".join(left))
+    lines += warns
+    lines.append("  - 对比图 rectified-review.jpg（照片与找到的边界｜校正结果｜光和颜色改在哪里、改了多少）需在显示尺寸和放大后核对；"
+                 "边界不对时用 rectify --corners 重做到 rectified.png，再 new --reprepare（不用校正：--reprepare --as-is）。%s"
+                 % end)
+    return "\n".join(lines) + "\n"
+
+
+def set_aside(job, stem):
+    """Rename <stem>.png and <stem>-review.jpg (stem: clean or rectified) to <stem>-unused[-N]…, so the job no longer
+    reads as prepared from a copy it does not use, and a hand-made copy is not lost. Returns [(old name, new name)]."""
     n = 1
     while True:
-        tag = "clean-unused" + ("" if n == 1 else "-%d" % n)
-        pairs = [("clean.png", tag + ".png"), ("clean-review.jpg", tag + "-review.jpg")]
+        tag = stem + "-unused" + ("" if n == 1 else "-%d" % n)
+        pairs = [(stem + ".png", tag + ".png"), (stem + "-review.jpg", tag + "-review.jpg")]
         if not any(os.path.exists(os.path.join(job, b)) for _, b in pairs):
             break
         n += 1
@@ -752,7 +900,7 @@ def set_aside(job):
     for a, b in pairs:
         if os.path.exists(os.path.join(job, a)):
             os.replace(os.path.join(job, a), os.path.join(job, b))
-            done.append(b)
+            done.append((a, b))
     return done
 
 
@@ -768,33 +916,64 @@ def watermark_summary(wm, job):
     return out
 
 
+def rectify_summary(rf, job, rect_in):
+    """The photo-correction step for new's JSON: rectify's own report with the job's paths, without its timing."""
+    out = {"run": rf["run"]}
+    if rf["run"] == "skipped":
+        out["detail"] = "--as-is: the picture is used as received (after the watermark step)"
+    elif rf["run"] == "failed":
+        out["detail"] = rf["detail"]
+    else:
+        out["input"] = rect_in
+        keys = ("note", "warnings", "size_in", "alternatives")      # exit 4: why, and the candidates for --corners
+        if rf["run"] == "corrected":
+            out.update(rectified=os.path.join(job, RECT), review=os.path.join(job, RECT_REVIEW),
+                       corrected=corrections(rf)[0])
+            keys = ("note", "warnings", "size_in", "size_out", "quad", "frame", "lens", "perspective", "light", "color",
+                    "exposure", "alternatives")
+        out.update((k, rf[k]) for k in keys if k in rf)
+    return out
+
+
 def cmd_new(argv):
     ap = argparse.ArgumentParser(prog="living-picture new",
                                  description="Start a job folder for one picture: remove a share-platform watermark if one is "
-                                             "found (pictures up to %d px on the longer side are searched; the picture itself is "
-                                             "never changed), prepare the working copy (work/picture.png), draw the grid view "
+                                             "found (pictures up to %d px on the longer side are searched), correct a casual photo "
+                                             "of the work (picture.py rectify: crop it from the wall, frame, mat or table round it, "
+                                             "undo perspective and lens bending, even out uneven light and a colour cast against "
+                                             "neutral paper, mat or wall; a flat scan or screenshot passes through unchanged), "
+                                             "prepare the working copy (work/picture.png) from the result, draw the grid view "
                                              "(look.jpg) and write a notes.md skeleton with the headings SKILL.md asks for, beginning "
-                                             "with the picture's path and sha256. It claims the folder before preparing anything and "
-                                             "never changes a folder that already holds a job (only --reprepare, for the same picture "
-                                             "at the same size). The job folder must stay out of git repositories and published "
-                                             "folders (SKILL.md), so it refuses those unless --force." % WATERMARK_MAX_SIDE)
+                                             "with the picture's path and sha256. The picture itself is never changed. It claims the "
+                                             "folder before preparing anything and never changes a folder that already holds a job "
+                                             "(only --reprepare, for the same picture). The job folder must stay out of git "
+                                             "repositories and published folders (SKILL.md), so it refuses those unless --force."
+                                             % WATERMARK_MAX_SIDE)
     ap.add_argument("image", help="the picture")
     ap.add_argument("--job", help="job folder (default: ./<picture name>)")
     ap.add_argument("--max", type=int, help="cap for the working copy's longer side (prepare --max; default 1600, "
-                                            "or the job's own size with --reprepare)")
+                                            "or the job's own size with --reprepare); the photo correction keeps up to "
+                                            "%d px, or this if larger" % RECTIFY_MAX)
     ap.add_argument("--force", action="store_true",
                     help="allow a job folder inside a git repository or inside the skill folder; it never overrides an existing job")
     ap.add_argument("--reprepare", action="store_true",
                     help="redo work/picture.png and look.jpg of an existing job, for example after the tools changed or after "
-                         "redoing clean.png by hand: only for the picture its notes.md names (same sha256) and only at the same "
-                         "working size, because plan.json, scene.json and the layers refer to that pixel grid. It prepares from "
-                         "the job's clean.png when there is one (the watermark repair, automatic or by hand), else from the "
-                         "picture, never searches for a watermark itself, and adds a line to notes.md")
+                         "redoing rectified.png or clean.png by hand: only for the picture its notes.md names (same sha256), and "
+                         "only at the job's own working size once plan.json, scene.json, layers or vision output refer to that "
+                         "pixel grid (before that a new size is taken and reported). It prepares from the job's rectified.png "
+                         "when there is one (the photo correction, automatic or by hand), else its clean.png (the watermark "
+                         "repair), else the picture; it never runs dewatermark or rectify itself, refuses instead of silently "
+                         "switching when a copy notes.md names is gone, and adds a line to notes.md")
     ap.add_argument("--keep-watermark", action="store_true",
                     help="do not look for a share-platform watermark (by default new looks in the lower right for a logo pill "
-                         "with an ID line under it, removes it with picture.py dewatermark into clean.png and prepares from "
-                         "that). With --reprepare: prepare from the picture as received even if the job has a clean.png, "
-                         "which is then renamed clean-unused.png")
+                         "with an ID line under it, removes it with picture.py dewatermark into clean.png and continues from "
+                         "that). With --reprepare: leave the job's clean.png out (it is renamed clean-unused.png)")
+    ap.add_argument("--as-is", action="store_true",
+                    help="do not correct the picture as a photo (by default new runs picture.py rectify, which finds the "
+                         "artwork in a casual photo, crops it, undoes perspective and lens bending and evens out light and "
+                         "colour against a neutral margin, mat or wall, into rectified.png with the review sheet "
+                         "rectified-review.jpg; it leaves a flat scan or screenshot alone). With --reprepare: prepare without "
+                         "the job's rectified.png, which is renamed rectified-unused.png")
     a = ap.parse_args(argv)
     image = os.path.abspath(os.path.expanduser(a.image))
     if not os.path.isfile(image):
@@ -833,68 +1012,111 @@ def cmd_new(argv):
     lp = os.path.join(ROOT, "bin", NAME)
     pic, look_jpg, notes = os.path.join(job, "work", "picture.png"), os.path.join(job, "look.jpg"), os.path.join(job, "notes.md")
     clean, review = os.path.join(job, "clean.png"), os.path.join(job, "clean-review.jpg")
+    rect, rect_review = os.path.join(job, RECT), os.path.join(job, RECT_REVIEW)
 
     if a.reprepare:
-        # The repair to use is the job's own clean.png, made by new or by hand with dewatermark; searching again here
-        # would overwrite a hand-made repair and could undo a mark kept on purpose.
+        # The copies to use are the job's own rectified.png and clean.png, made by new or by hand with rectify and
+        # dewatermark; running those again here would overwrite a hand-made copy and could undo a choice made on purpose.
         old = st["size"]
-        has_clean = os.path.isfile(clean)
-        if st["prepared_from"] == "clean.png" and not has_clean and not a.keep_watermark:
-            die("notes.md says work/picture.png was prepared from clean.png (the picture with a share-platform watermark "
+        has_clean, has_rect = os.path.isfile(clean), os.path.isfile(rect)
+        prior, rec = st["prepared_from"], st["rectified"]
+        if prior == RECT and not has_rect and not a.as_is:
+            die("notes.md says work/picture.png was prepared from rectified.png (the photo corrected by rectify), but %s is "
+                "gone. Nothing was changed. Make it again (%s rectify %s --out %s, then check %s) and run this again, or "
+                "pass --as-is to prepare without the photo correction."
+                % (rect, q(lp), q(clean if has_clean else image), q(rect), rect_review))
+        use_rect = has_rect and not a.as_is
+        # what rectified.png was corrected from: known only while it is the copy notes.md recorded (None: by hand)
+        origin = rec[1] if use_rect and rec and rec[0] == sha256(rect, 12) else None
+        redo = "%s rectify %%s --out %s, then check %s" % (q(lp), q(rect), rect_review)
+        if use_rect and origin == "clean.png" and a.keep_watermark:
+            die("rectified.png was corrected from clean.png (notes.md), so it carries the watermark repair that "
+                "--keep-watermark leaves out. Nothing was changed. Redo it from the picture as received (%s) and run this "
+                "again, or add --as-is to prepare from the picture as received without the photo correction."
+                % (redo % q(image)))
+        if use_rect and origin == "picture" and has_clean and not a.keep_watermark:
+            die("the job has clean.png (a watermark repair), but rectified.png was corrected from the picture as received "
+                "(notes.md), so the repair is not in it. Nothing was changed. Redo it from the repair (%s) and run this "
+                "again; or pass --keep-watermark to set clean.png aside and keep this photo correction, or --as-is to "
+                "prepare from clean.png without the photo correction." % (redo % q(clean)))
+        used_clean = prior == "clean.png" or (prior == RECT and bool(rec) and rec[1] == "clean.png")
+        if not use_rect and used_clean and not has_clean and not a.keep_watermark:
+            die("notes.md says the working copy was made from clean.png (the picture with a share-platform watermark "
                 "removed), but %s is gone. Nothing was changed. Make it again (%s dewatermark %s --out %s, then check %s) "
                 "and run this again, or pass --keep-watermark to prepare from the picture as received, mark and all."
                 % (clean, q(lp), q(image), q(clean), review))
-        source = clean if has_clean and not a.keep_watermark else image
-        tmp, prep, look, _ = prepare_into(job, image, a.max or (max(old) if old else None),  # by default the job's own size
-                                          source=source)
+        source = rect if use_rect else clean if has_clean and not a.keep_watermark else image
+        name = RECT if source == rect else "clean.png" if source == clean else "picture"
+        tmp, prep, look, _, _, _ = prepare_into(job, image, a.max or (max(old) if old else None),  # by default the job's own size
+                                                source=source)
         try:
             new = list(prep["size"])
-            if old and new != list(old):
+            resized = bool(old) and new != list(old)
+            if resized and on_grid(job):  # a new size only while nothing refers to the old grid (right after new)
                 die("re-preparing gives %d×%d px, but this job's working picture is %d×%d px, and %s refer to that pixel grid. "
                     "Nothing was changed. A different working size needs a new job folder."
-                    % (new[0], new[1], old[0], old[1], ", ".join(on_grid(job)) or "its notes.md"))
+                    % (new[0], new[1], old[0], old[1], ", ".join(on_grid(job))))
             changed = not (os.path.exists(pic) and filecmp.cmp(pic, prep["picture"], shallow=False))
             move_in(tmp, job)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-        try:
-            aside = set_aside(job) if a.keep_watermark else []  # also a review sheet left from a deleted clean.png
+        aside_c, aside_r = [], []
+        try:  # also a review sheet left from a deleted copy
+            aside_c = set_aside(job, "clean") if a.keep_watermark else []
+            aside_r = set_aside(job, "rectified") if a.as_is else []
         except OSError as e:
-            aside = []
-            warnings.append("could not rename clean.png out of the way (%s): the next --reprepare would use it again; "
-                            "rename it yourself" % e)
-        stale =[n for n in ("work/layers", "work/review", "out") if os.path.exists(os.path.join(job, n))]
+            warnings.append("could not rename a copy that is no longer used out of the way (%s): the next --reprepare "
+                            "would use it again; rename it yourself" % e)
+        stale = [n for n in ("work/layers", "work/review", "out") if os.path.exists(os.path.join(job, n))]
         if changed and stale:
             warnings.append("work/picture.png changed at the same size: %s were made from the previous copy; re-run cut, "
                             "bundle and the checks" % ", ".join(stale))
+        if resized:
+            warnings.append("work/picture.png is now %d×%d px instead of %d×%d: nothing referred to the old pixel grid yet, "
+                            "but coordinates noted before (notes.md) are in the old size" % (new[0], new[1], old[0], old[1]))
         date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-        if source == clean:
-            line = "- 重新准备（%s，living-picture new --reprepare）：工作图由 clean.png 准备（sha256 %s…）；像素%s。\n" % (
-                date, sha256(clean, 12), "有变化" if changed else "未变")
-        else:
-            line = "- 重新准备（%s，living-picture new --reprepare%s）：工作图由原图准备；像素%s%s。\n" % (
-                date, " --keep-watermark" if a.keep_watermark else "", "有变化" if changed else "未变",
-                "；clean.png 改名为 %s，不再使用" % "、".join(aside) if aside else "")
+        s = prep.get("scale_from_source") or 1
+        what = {RECT: lambda: "%s；%s" % (rect_record(sha256(rect, 12), origin), from_phrase(RECT)),
+                "clean.png": lambda: "%s（sha256 %s…）" % (from_phrase("clean.png"), sha256(clean, 12)),
+                "picture": lambda: from_phrase("picture")}[name]()
+        line = "- 重新准备（%s，living-picture new --reprepare%s）：%s；像素%s%s%s。\n" % (
+            date, "".join(f for f, on in ((" --keep-watermark", a.keep_watermark), (" --as-is", a.as_is)) if on), what,
+            "有变化" if changed else "未变", "；工作尺寸由 %d×%d 改为 %d×%d" % (old[0], old[1], new[0], new[1]) if resized else "",
+            "；%s，不再使用" % "、".join("%s 改名为 %s" % p for p in aside_c + aside_r) if aside_c + aside_r else "")
         try:
             with open(notes, encoding="utf-8") as f:
-                text = f.read()
-            write_text(notes, add_to_section(text, "资产处理", line))
+                text = add_to_section(f.read(), "资产处理", line)
+            if resized:
+                text = add_to_section(text, "工作尺寸", "- work/picture.png：%d×%d px（%s 重新准备后；%s）\n" % (
+                    new[0], new[1], date, size_note(name, s)))
+            write_text(notes, text)
             added = line.strip()
         except (OSError, ValueError) as e:
             warnings.append("could not add the re-prepare to notes.md (%s): record it there yourself" % e)
             added = None
-        s = prep.get("scale_from_source") or 1
+        # the watermark repair is in the working copy: directly, through rectified.png, or unknown (rectified.png by hand)
+        wm_in = True if name == "clean.png" or origin == "clean.png" else \
+            None if name == RECT and origin is None and has_clean and not a.keep_watermark else False
         print(json.dumps({"job": job, "picture": pic, "size": new, "scale_from_source": s, "look": look_jpg,
                           "grid_every": look.get("grid_every"), "notes": notes, "notes_written": False, "notes_added": added,
-                          "reprepared": True, "changed": changed, "prepared_from": source,
-                          "watermark_removed": source == clean,
-                          "watermark": {"search": "not run: --reprepare prepares from the job's clean.png when there is one, "
-                                                  "else from the picture", "set_aside": aside},
+                          "reprepared": True, "changed": changed, "size_changed": [list(old), new] if resized else None,
+                          "prepared_from": source, "watermark_removed": wm_in,
+                          "watermark": {"search": "not run: --reprepare prepares from the job's own copies (rectified.png, "
+                                                  "else clean.png, else the picture)", "set_aside": [b for _, b in aside_c]},
+                          "photo_corrected": name == RECT,
+                          "rectify": {"run": "not run: --reprepare uses the job's rectified.png when there is one",
+                                      "corrected_from": ({"picture": image, "clean.png": clean}.get(origin) or
+                                                         "not recorded (made by hand)") if name == RECT else None,
+                                      "set_aside": [b for _, b in aside_r]},
                           "warnings": warnings,
                           "next": ["look at %s" % look_jpg] +
+                                  (["check the photo correction: %s (the photo with the boundary found | the corrected "
+                                    "picture | where light and colour changed) at display size and zoomed in" % rect_review]
+                                   if name == RECT and os.path.exists(rect_review) else []) +
                                   (["check the watermark repair: %s (before | after | repaired) at display size and 4x" % review]
-                                   if source == clean and os.path.exists(review) else []) +
-                                  (["re-run cut, bundle and the checks: the working copy's pixels changed"] if changed else []) +
+                                   if wm_in and os.path.exists(review) else []) +
+                                  (["re-run cut, bundle and the checks: the working copy's pixels changed"]
+                                   if changed and stale else []) +
                                   ["add to notes.md why it was re-prepared (a line was added under 资产处理)"]},
                          ensure_ascii=False))
         return 0
@@ -912,8 +1134,9 @@ def cmd_new(argv):
         f.write(NOTES_PENDING.format(stem=stem, mark=PENDING, date=date, source=image, sha=sha))
     done = moved = False
     try:
-        tmp, prep, look, wm = prepare_into(job, image, a.max, search=not a.keep_watermark)
-        wm = wm or {"search": "kept"}
+        tmp, prep, look, wm, rf, own = prepare_into(job, image, a.max, search=not a.keep_watermark,
+                                                    rectify_max=None if a.as_is else max(RECTIFY_MAX, a.max or 0))
+        wm, rf = wm or {"search": "kept"}, rf or {"run": "skipped"}
         try:
             move_in(tmp, job)
             moved = True
@@ -921,15 +1144,20 @@ def cmd_new(argv):
             shutil.rmtree(tmp, ignore_errors=True)
         w, h = prep["size"]
         s = prep.get("scale_from_source") or 1
+        corrected = rf["run"] == "corrected"
+        rect_in = "clean.png" if wm["search"] == "removed" else "picture"   # what rectify ran on
+        name = RECT if corrected else rect_in                               # what work/picture.png was prepared from
         text = NOTES.format(stem=stem, source=image, sha=sha, bytes=os.path.getsize(image),
-                            source_size="；原图约 %d×%d px" % (round(w / s), round(h / s)),
-                            date=date, w=w, h=h, scale=round(s, 4), skill=ROOT, fingerprint=skill_fingerprint())
+                            source_size="；原图约 %d×%d px" % (own[0], own[1]), date=date, w=w, h=h,
+                            made=size_note(name, s), skill=ROOT, fingerprint=skill_fingerprint())
+        text = add_to_section(text, "资产处理", watermark_note(wm, corrected))
+        text = add_to_section(text, "资产处理", rectify_note(rf, rect_in, sha256(rect, 12) if corrected else None))
         with open(notes, "w", encoding="utf-8") as f:  # still the placeholder this run created above
-            f.write(add_to_section(text, "资产处理", watermark_note(wm)))
+            f.write(text)
         done = True
     finally:
         if not done:  # give the folder back: a failed run must not leave a half job that blocks the next one
-            for p in ([pic, look_jpg, clean, review] if moved else []) + [notes]:
+            for p in ([pic, look_jpg, clean, review, rect, rect_review] if moved else []) + [notes]:
                 try:
                     os.remove(p)
                 except OSError:
@@ -942,18 +1170,47 @@ def cmd_new(argv):
                         pass
     if wm["search"] == "failed":
         warnings.append("the watermark search failed, so the picture was prepared as received: %s" % wm["detail"])
+    if rf["run"] == "failed":
+        warnings.append("the photo correction failed, so %s was prepared as it is: %s"
+                        % ("clean.png" if rect_in == "clean.png" else "the picture", rf["detail"]))
+    warnings += ["photo correction: %s" % w_ for w_ in rf.get("warnings") or []]
+    src_r = clean if rect_in == "clean.png" else image    # what rectify ran on, and what to redo it from
+    reprep = "%s new %s --job %s --reprepare" % (q(lp), q(image), q(job))
+    redo = ("%s rectify %s --out %s --corners \"x,y;x,y;x,y;x,y\" (the work's corners in that picture's pixels, top-left, "
+            "top-right, bottom-right, bottom-left; %s look %s --out %s shows that picture with a grid)"
+            % (q(lp), q(src_r), q(rect), q(lp), q(src_r), q(os.path.join(job, "photo-look.jpg"))))
     by_hand = ("if look.jpg shows a share-platform mark in the lower right: %s dewatermark %s --out %s (rough --pill/--line "
-               "boxes if it is not found), check %s, then %s new %s --job %s --reprepare"
-               % (q(lp), q(image), q(clean), review, q(lp), q(image), q(job)))
-    print(json.dumps({"job": job, "picture": pic, "size": [w, h], "scale_from_source": s, "look": look_jpg,
+               "boxes if it is not found), check %s, %sthen %s"
+               % (q(lp), q(image), q(clean), review,
+                  "redo the photo correction from it (%s rectify %s --out %s, adding --corners if you gave them before) and "
+                  "check %s, " % (q(lp), q(clean), q(rect), rect_review) if corrected else "", reprep))
+    nxt = []
+    if corrected:
+        nxt += ["check the photo correction first: %s (the photo with the boundary found | the corrected picture | where "
+                "light and colour changed) at display size and zoomed in: the boundary on the work's own edge all round, no "
+                "frame, mat or wall left and nothing of the work cut off, straight lines straight, colours like the work's "
+                "own rather than a white-balanced room%s" % (rect_review if os.path.exists(rect_review) else rect,
+                                                             "; weigh the warnings" if rf.get("warnings") else ""),
+                "if the boundary or a correction is wrong, redo it into the same file: %s, or take a candidate from "
+                "rectify.alternatives, or use --frame keep|remove, --light off, --color off; check %s again, then %s (a new "
+                "working size is taken until plan.json, layers or vision output exist). To work from %s without the "
+                "correction: %s --as-is" % (redo, rect_review, reprep,
+                                            "clean.png" if rect_in == "clean.png" else "the picture as received", reprep)]
+    if wm["search"] == "removed":
+        nxt.append("check the watermark repair: %s (before | after | repaired) at display size and 4x" % review)
+    nxt.append("look at %s (and zoom with: %s look %s --box X0 Y0 X1 Y1)" % (look_jpg, q(lp), q(pic)))
+    if wm["search"] in ("skipped", "failed"):
+        nxt.append(by_hand)
+    if rf["run"] in ("nothing to correct", "failed"):
+        nxt.append("if look.jpg shows a photo of the work rather than the work alone (wall, frame, mat, table or hands round "
+                   "it, or taken at an angle): %s, check %s, then %s" % (redo, rect_review, reprep))
+    nxt += ["write the picture's intent and reading into notes.md (SKILL.md rules 1-2)",
+            "write %s, then: %s cut %s" % (os.path.join(job, "plan.json"), q(lp), q(os.path.join(job, "plan.json")))]
+    print(json.dumps({"job": job, "picture": pic, "size": [w, h], "scale_from_source": s,
+                      "prepared_from": {RECT: rect, "clean.png": clean, "picture": image}[name], "look": look_jpg,
                       "grid_every": look.get("grid_every"), "notes": notes, "notes_written": True, "warnings": warnings,
                       "watermark_removed": wm["search"] == "removed", "watermark": watermark_summary(wm, job),
-                      "next": (["check the watermark repair: %s (before | after | repaired) at display size and 4x" % review]
-                               if wm["search"] == "removed" else []) +
-                              ["look at %s (and zoom with: %s look %s --box X0 Y0 X1 Y1)" % (look_jpg, q(lp), q(pic))] +
-                              ([by_hand] if wm["search"] in ("skipped", "failed") else []) +
-                              ["write the picture's intent and reading into notes.md (SKILL.md rules 1-2)",
-                               "write %s, then: %s cut %s" % (os.path.join(job, "plan.json"), q(lp), q(os.path.join(job, "plan.json")))]},
+                      "photo_corrected": corrected, "rectify": rectify_summary(rf, job, src_r), "next": nxt},
                      ensure_ascii=False))
     return 0
 

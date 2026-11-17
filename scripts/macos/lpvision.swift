@@ -21,12 +21,16 @@ import Vision
 let usage = """
 usage: lpvision <what> <image> --out <dir> [--box x0 y0 x1 y1] [--zoom k] [--face x0 y0 x1 y1]...
                 [--langs zh-Hans,en-US] [--save-input file.png]
+       lpvision quads <image> [--max n] [--max-side px] [--min-size f] [--tolerance deg] [--min-aspect f]
+                [--min-confidence f]
        lpvision check
   what: comma list of subjects, persons, faces, pose, saliency, text, or all
   --box   analyse only this region (picture pixels); it is enlarged (--zoom, auto by default) so that
           small faces and figures reach the size the models expect; results map back to the picture
   --face  a face box you know is there: face landmarks are fitted inside it even if detection missed it
   --save-input  also write the image exactly as Vision analysed it (cropped, enlarged, flattened)
+  quads   outlines of a photographed flat rectangle (artwork, mat, frame): document segmentation and
+          rectangle detection, raw, in picture pixels; scripts/lp/apple.py orders, merges and ranks them
 """
 
 struct Fail: Error { let msg: String }
@@ -353,6 +357,119 @@ func text(_ handler: VNImageRequestHandler, _ f: Frame, langs: [String]) throws 
     return ["lines": lines, "marks": regions]
 }
 
+// ------------------------------------------------------------------ quads: a photographed artwork's outline
+
+/// The picture upright and flattened on white like loadPicture, but decoded at most `maxSide` px on its
+/// longer side (0: full size): Vision finds rectangles on a reduced image anyway, and a 48 MP photo decoded
+/// whole costs 200 MB and a second. Also returns the full upright size, which the normalised answers map to.
+func loadUpright(_ path: String, maxSide: Int) throws -> (img: CGImage, W: Int, H: Int) {
+    guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+          CGImageSourceGetCount(src) > 0 else { throw Fail(msg: "cannot read image: \(path)") }
+    let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] ?? [:]
+    let w = props[kCGImagePropertyPixelWidth] as? Int ?? 0, h = props[kCGImagePropertyPixelHeight] as? Int ?? 0
+    guard w > 0, h > 0 else { throw Fail(msg: "image has no pixels: \(path)") }
+    let full = max(w, h), side = maxSide > 0 ? min(full, maxSide) : full
+    let opts: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                 kCGImageSourceCreateThumbnailWithTransform: true,
+                                 kCGImageSourceThumbnailMaxPixelSize: side,
+                                 kCGImageSourceShouldCacheImmediately: true]
+    guard let img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else {
+        throw Fail(msg: "cannot decode image: \(path)")
+    }
+    // The transform only turns or mirrors: the upright full size is the stored one, swapped by EXIF
+    // orientations 5-8 (the ones that turn by a quarter).
+    var W = img.width, H = img.height
+    if side < full {
+        let turned = (5...8).contains(props[kCGImagePropertyOrientation] as? Int ?? 1)
+        (W, H) = turned ? (h, w) : (w, h)
+    }
+    return (try draw(img, CGRect(x: 0, y: 0, width: img.width, height: img.height), img.width, img.height), W, H)
+}
+
+/// Vision's quad (normalised, origin bottom left) in picture pixels, origin top left, corners as Vision
+/// names them (TL, TR, BR, BL). Pixel (x, y) covers [x, x+1] x [y, y+1], so the picture's own outline is
+/// (0, 0) ... (W, H). Not clipped: a corner outside the picture says the thing runs off the photo.
+func quadEntry(_ o: VNRectangleObservation, _ W: Int, _ H: Int) -> [String: Any] {
+    let p = { (q: CGPoint) -> [Double] in [r2(Double(q.x) * Double(W)), r2((1 - Double(q.y)) * Double(H))] }
+    return ["corners": [p(o.topLeft), p(o.topRight), p(o.bottomRight), p(o.bottomLeft)],
+            "confidence": (Double(o.confidence) * 1000).rounded() / 1000]
+}
+
+func quadsMain(_ argv: [String]) -> Int32 {
+    var args = argv
+    var maxN = 8, maxSide = 2048
+    // Steep views and long scrolls: corners up to 30 degrees off square, sides down to 1:10. A painting
+    // filling a fifth of a 4:3 photo has its short side at 0.25-0.5 of the photo's short side.
+    var minSize: Float = 0.12, tolerance: Float = 30, minAspect: Float = 0.1, minConfidence: Float = 0.2
+    var positional: [String] = []
+    func num(_ flag: String, _ ok: (Double) -> Bool) throws -> Double {
+        guard !args.isEmpty, let v = Double(args.removeFirst()), v.isFinite, ok(v) else { throw Fail(msg: "\(flag): bad value") }
+        return v
+    }
+    do {
+        while !args.isEmpty {
+            let a = args.removeFirst()
+            switch a {
+            case "--max": maxN = Int(try num(a) { $0 >= 1 && $0 <= 64 && $0 == $0.rounded() })
+            case "--max-side": maxSide = Int(try num(a) { $0 == 0 || ($0 >= 256 && $0 == $0.rounded()) })
+            case "--min-size": minSize = Float(try num(a) { $0 >= 0 && $0 <= 1 })
+            case "--tolerance": tolerance = Float(try num(a) { $0 >= 0 && $0 <= 45 })
+            case "--min-aspect": minAspect = Float(try num(a) { $0 >= 0 && $0 <= 1 })
+            case "--min-confidence": minConfidence = Float(try num(a) { $0 >= 0 && $0 <= 1 })
+            default:
+                if a.hasPrefix("--") { throw Fail(msg: "unknown option \(a)") }
+                positional.append(a)
+            }
+        }
+        guard positional.count == 1 else { throw Fail(msg: "quads needs one <image>") }
+        let t0 = Date()
+        let (img, W, H) = try loadUpright(positional[0], maxSide: maxSide)
+        let handler = VNImageRequestHandler(cgImage: img, options: [:])
+        var res = capabilities()
+        res["image"] = positional[0]
+        res["size"] = [W, H]
+        res["analysed"] = [img.width, img.height]
+        var timings: [String: Int] = ["load": ms(t0)], errors: [String: String] = [:]
+        // The dominant document-like thing: one quad, often the artwork with its paper or mat.
+        var t = Date()
+        if #available(macOS 12.0, *) {
+            let doc = VNDetectDocumentSegmentationRequest()
+            do {
+                try handler.perform([doc])
+                res["document"] = (doc.results ?? []).map { quadEntry($0, W, H) }
+            } catch { errors["document"] = "\(error.localizedDescription)" }
+        } else { errors["document"] = "document segmentation needs macOS 12 or later" }
+        timings["document"] = ms(t)
+        // Every rectangle: the painted surface, the mat's window, the frame's outer edge, and things
+        // inside the painting (a window, a sign). apple.py decides which is which.
+        t = Date()
+        let rect = VNDetectRectanglesRequest()
+        rect.minimumAspectRatio = minAspect
+        rect.maximumAspectRatio = 1
+        rect.quadratureTolerance = tolerance
+        rect.minimumSize = minSize
+        rect.minimumConfidence = minConfidence
+        rect.maximumObservations = maxN
+        do {
+            try handler.perform([rect])
+            res["rectangles"] = (rect.results ?? []).map { quadEntry($0, W, H) }
+        } catch { errors["rectangles"] = "\(error.localizedDescription)" }
+        timings["rectangles"] = ms(t)
+        res["options"] = ["max": maxN, "max_side": maxSide, "min_size": r2(Double(minSize)), "tolerance": r2(Double(tolerance)),
+                          "min_aspect": r2(Double(minAspect)), "min_confidence": r2(Double(minConfidence))]
+        res["errors"] = errors
+        res["timings_ms"] = timings
+        emit(res)
+        return 0
+    } catch let e as Fail {
+        emit(["error": e.msg, "usage": usage])
+        return 2
+    } catch {
+        emit(["error": "\(error.localizedDescription)"])
+        return 2
+    }
+}
+
 // ------------------------------------------------------------------ main
 
 func capabilities() -> [String: Any] {
@@ -365,6 +482,7 @@ func capabilities() -> [String: Any] {
 func main() -> Int32 {
     var args = Array(CommandLine.arguments.dropFirst())
     if args.first == "check" { emit(capabilities()); return 0 }
+    if args.first == "quads" { return quadsMain(Array(args.dropFirst())) }
     if args.isEmpty || args.contains("--help") || args.contains("-h") { FileHandle.standardError.write(Data((usage + "\n").utf8)); return args.isEmpty ? 2 : 0 }
     var outDir: String?, box: [Double]?, zoom: Double?, langs: [String] = [], saveInput: String?
     var given: [[Double]] = [], positional: [String] = []

@@ -15,6 +15,7 @@
   inspect  a cut layer over several grounds next to what it uncovers, or each of its pieces alone
   vision   macOS only: Apple Vision starting points (subject/person masks, eyes, heads, joints, text, saliency)
   dewatermark  find and remove a share-platform watermark (e.g. Xiaohongshu) before preparing; writes a review sheet
+  rectify  a casual photo of a painting: crop to it, undo perspective and lens, even out light, remove a colour cast
 
 Run any command with --help. Needs Python 3.9+, numpy, scipy, Pillow.
 """
@@ -224,6 +225,25 @@ def cmd_dewatermark(a):
         sys.exit(4)                    # nothing found, nothing written: callers fall back to the picture as received
 
 
+def cmd_rectify(a):
+    from lp import photo
+    out = a.out
+    if os.path.isdir(out) or not os.path.splitext(out)[1]:
+        out = os.path.join(out, "rectified.png")
+    elif os.path.splitext(out)[1].lower() != ".png":
+        out = os.path.splitext(out)[0] + ".png"          # the corrected picture stays lossless
+    review = a.review or os.path.splitext(out)[0] + "-review.jpg"
+    try:
+        code, rep = photo.rectify(a.photo, out, review=review, corners=a.corners, frame=a.frame, lens=a.lens,
+                                  light=a.light, color=a.color, max_side=max(0, a.max))
+    except Exception as e:             # unreadable photo, bad --corners, or a failure: one JSON line, exit 2
+        print(_j({"error": "%s%s" % ("" if isinstance(e, (OSError, ValueError)) else type(e).__name__ + ": ", e)}))
+        sys.exit(2)
+    print(_j(rep))
+    if code:
+        sys.exit(code)                 # 4: nothing to correct or no boundary found; nothing written
+
+
 def main():
     _need()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -348,6 +368,21 @@ def main():
     p.add_argument("--mode", default="auto", choices=["auto", "untint", "fill", "hybrid"],
                    help="under the pill: untint recovers the lightened paint, fill repaints from round it; auto picks by the ground's texture")
     p.set_defaults(fn=cmd_dewatermark)
+
+    p = sub.add_parser("rectify", help="a casual photo of a painting: crop, perspective, lens, uneven light, colour cast")
+    p.add_argument("photo", help="the photo as received (left unchanged)")
+    p.add_argument("--out", required=True, help="corrected picture, PNG (e.g. <job>/rectified.png); prepare from it afterwards")
+    p.add_argument("--review", help="photo with the boundary | result | light change (default: next to --out, *-review.jpg)")
+    p.add_argument("--corners", help='the artwork\'s corners in photo pixels, "x,y;x,y;x,y;x,y" (any order); skips detection')
+    p.add_argument("--frame", default="auto", choices=["auto", "keep", "remove"],
+                   help="auto: keep the painted surface inside a plain frame and its mat (a sheet's own paper margin "
+                        "stays); keep: keep them; remove: also cut away an ornate or uneven frame")
+    p.add_argument("--lens", default="auto", choices=["auto", "off"], help="radial lens distortion, from the sides' straightness")
+    p.add_argument("--light", default="auto", choices=["auto", "off"], help="even out lamp falloff, a hotspot, vignetting")
+    p.add_argument("--color", default="auto", choices=["auto", "off"], help="remove a warm or cool light's colour cast")
+    p.add_argument("--max", type=int, default=4096,
+                   help="cap for the output's longer side (px; 0 = none); never enlarged beyond the work's own detail")
+    p.set_defaults(fn=cmd_rectify)
 
     a = ap.parse_args()
     if not getattr(a, "fn", None):

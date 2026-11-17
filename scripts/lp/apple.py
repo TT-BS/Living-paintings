@@ -1088,3 +1088,408 @@ def _summary(res, path):
     s["timings_ms"] = res["timings_ms"]
     s["note"] = "starting points: look at the review sheet, then copy entries from vision.json after checking them"
     return s
+
+
+# ------------------------------------------------------------------ a photographed artwork's outline (rectify)
+
+# How far (share of the picture's diagonal) a side may move onto an edge. Vision's rectangles are within
+# 1% of the diagonal nine times in ten; reaching further mostly finds the neighbouring edge (frame, bevel).
+# Within NEAR, a fairly well supported edge is taken before a better one further off.
+REACH, NEAR = 0.012, 0.005
+
+
+def quads(image_path, max_n=8, refine=True, log=None):
+    """Where a photographed flat artwork, its mat or its frame may be: up to `max_n` outlines, best first.
+
+    Each entry: {"corners": [[x, y] TL, TR, BR, BL], "confidence": 0..1, "source": "document" | "rectangle"},
+    and what choosing among them needs:
+      share      area as a share of the picture
+      support    [top, right, bottom, left]: share of each side's length (its ends left out) where the
+                 picture has an edge on the line
+      agree      both of Vision's detectors found this outline
+      nested_in  index of the next outline out when this one is a layer in it (artwork in its mat, mat in its
+                 frame): the band between them even all round, or this one at least 60% of its area; else None
+      holds      index of the next outline in, likewise; else None
+      inside     index of an outline this one lies well inside without being a layer of it: most likely part
+                 of that picture (a window, a colour block); such entries come last, at half confidence
+      cut_off    the work runs off the photo: a corner outside it, a side along its border, or a side near
+                 the border with no edge under it
+      whole      the outline is the picture's own border (corners set to it, confidence 0): Vision took the
+                 whole picture for the document, as it does for a flat scan or screenshot
+      vision     Vision's own corners, when they were moved
+    Corners are in the picture's pixels after EXIF orientation, origin top left, pixel (x, y) covering
+    [x, x+1] x [y, y+1] (Vision's frame; PIL puts pixel x at x, half a pixel off). Corner order is the
+    picture's: a work hung sideways comes out sideways.
+
+    Vision gives two kinds of answer: document segmentation (one outline, on a grid about 1/150 of the
+    picture, landing on the frame, the mat or the painted surface with no rule) and rectangle detection
+    (several outlines: a frame's outer edge, usually first, its window, the mat's window, and rectangles
+    inside the painting such as a window or a colour block). Their confidences say nothing (0 or 0.99 for
+    the same good answer, 1.0 for every rectangle), so `confidence` is this function's own: the edge
+    support along the sides, size (3% of the picture or less: none; 15% or more: full), corner angles,
+    lying inside the picture, a little more when both detectors agree. With `refine`, each side is first
+    moved onto the edge running along it, to a fraction of a pixel: within 0.5% of the picture's diagonal
+    an edge on 40% of the side is taken, else the nearest of the edges within 1.2% that are nearly as well
+    supported as the best; a side without a consistent edge stays where Vision put it. Where Vision's own
+    side lies on a frame's moulding, the refined side can land on a moulding line.
+
+    Order: chains of nested outlines (frame, mat, artwork) and single outlines by their best confidence;
+    within a chain the innermost first, so the first entry is the visible artwork and nested_in leads out
+    to its mat and frame. The picture's own border comes first only when nothing else reaches 0.5. A
+    rectangle painted inside a flat picture can still come first: nothing here tells a photographed work
+    from a painted rectangle for sure. Every result is a starting point to draw on the photo and check by
+    eye. [] when Vision found no usable outline.
+
+    Raises Unavailable when Vision cannot be used (not macOS, no compiler, unwritable cache, the helper
+    failed or could not read the picture), ValueError for a bad max_n or a missing file."""
+    if isinstance(max_n, bool) or not isinstance(max_n, int) or not 1 <= max_n <= 32:
+        raise ValueError("quads: max_n must be an integer from 1 to 32")
+    image = os.path.abspath(image_path)
+    if not os.path.isfile(image):
+        raise ValueError("quads: no such picture: %s" % image_path)
+    # Ask for more rectangles than wanted: shapes inside the painting crowd the list, and rank comes later.
+    raw = _vision_quads(image, min(64, max(16, 3 * max_n)), log)
+    W, H = raw["size"]
+    found = []
+    for src, key in (("document", "document"), ("rectangle", "rectangles")):
+        for e in raw.get(key) or []:
+            q = _canon(e.get("corners"))
+            if q is not None and _area(q) >= 0.002 * W * H:      # a speck is never the work
+                found.append({"q": q, "vision": q.copy(), "source": src})
+    if not found:
+        return []
+    planes, k = _edge_planes(image, (W, H))
+    diag = math.hypot(W, H)
+    for f in found:
+        f["q"], f["support"] = _fit(planes, f["q"] * k, max(6.0, REACH * diag * k) if refine else 0.0)
+        f["q"] = f["q"] / k
+    found = _merge(found, max(3.0, 0.006 * diag))
+    for f in found:
+        f["confidence"] = _quad_confidence(f, W, H)
+    return _ranked(found, W, H, max_n)
+
+
+def _vision_quads(image, n, log=None):
+    exe = swift_tool("lpvision", log)
+    try:
+        p = subprocess.run([exe, "quads", image, "--max", str(n)], capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        raise Unavailable("lpvision quads did not finish within 3 minutes")
+    except OSError as e:
+        raise Unavailable("cannot run %s: %s" % (exe, e))
+    try:
+        res = json.loads(p.stdout)
+    except ValueError:
+        raise Unavailable("lpvision quads failed (exit %d): %s" % (p.returncode, (p.stderr or p.stdout).strip()[-800:]))
+    if p.returncode != 0 or "error" in res:
+        raise Unavailable("lpvision quads: %s" % res.get("error", "exit %d" % p.returncode))
+    errs = res.get("errors") or {}
+    if len(errs) == 2:                        # neither detector ran: nothing to rank, not "nothing there"
+        raise Unavailable("Vision could not look for outlines: %s" % "; ".join("%s: %s" % kv for kv in sorted(errs.items())))
+    if errs and log:
+        log("Vision: %s" % "; ".join("%s: %s" % kv for kv in sorted(errs.items())))
+    return res
+
+
+def _canon(c):
+    """Vision's TL, TR, BR, BL as a convex quad, clockwise on screen (y down) from its top-left corner
+    (least x + y), or None. Vision's own order decides the shape: a crossed one is a broken answer, not
+    a quad to sort into shape."""
+    try:
+        q = np.asarray(c, float).reshape(4, 2)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(q).all():
+        return None
+    e = np.roll(q, -1, 0) - q
+    cross = e[:, 0] * np.roll(e, -1, 0)[:, 1] - e[:, 1] * np.roll(e, -1, 0)[:, 0]
+    if not ((cross > 0).all() or (cross < 0).all()):
+        return None
+    if cross[0] < 0:                          # mirrored: turn it clockwise
+        q = q[::-1]
+    return np.roll(q, -int(np.argmin(q.sum(1))), 0)
+
+
+def _area(q):
+    return 0.5 * abs(float(np.dot(q[:, 0], np.roll(q[:, 1], -1)) - np.dot(q[:, 1], np.roll(q[:, 0], -1))))
+
+
+def _edge_planes(image, size):
+    """The picture as the skill reads it (upright, sRGB, flattened on white) as contiguous float planes,
+    at most 4096 px on the longer side, and the scale from picture pixels to these planes."""
+    rgb, k = io.load_image(image, 4096)
+    if rgb.shape[-1] == 4:
+        rgb = rgb[..., :3] * rgb[..., 3:4] + (1 - rgb[..., 3:4])
+    h, w = rgb.shape[:2]
+    if abs(w - size[0] * k) > 1.01 or abs(h - size[1] * k) > 1.01:
+        raise Unavailable("Vision read %s as %dx%d, the skill as %dx%d: orientation tags disagree; use a copy without "
+                          "them (picture.py prepare)" % (image, size[0], size[1], round(w / k), round(h / k)))
+    return [np.ascontiguousarray(rgb[..., c]) for c in range(3)], (w / float(size[0]))
+
+
+def _side(planes, a, b, R, step=0.5):
+    """Edge evidence across the side a -> b of a clockwise quad. For rows along the side (its ends left
+    out, where hands, corner blocks and frame mitres sit), the colour gradient across it from R px inside
+    to R px outside. Returns along-positions, across-offsets (outward positive), gradient, length, axes."""
+    H, W = planes[0].shape
+    d = b - a
+    L = float(math.hypot(d[0], d[1]))
+    u = d / L
+    nv = np.array([u[1], -u[0]])               # outward, for clockwise corners in y-down pixels
+    s = np.linspace(0.1 * L, 0.9 * L, int(np.clip(L / 4.0, 16, 240)))
+    m = max(2, int(round(R / step)))
+    t = np.arange(-m, m + 1) * step
+    X = a[0] + u[0] * s[:, None] + nv[0] * t[None, :]
+    Y = a[1] + u[1] * s[:, None] + nv[1] * t[None, :]
+    g = np.zeros(X.shape, np.float32)
+    for c in planes:
+        v = ndi.map_coordinates(c, [Y - 0.5, X - 0.5], order=1, mode="nearest", output=np.float32)
+        v = ndi.gaussian_filter1d(v, 1.0, axis=0)                    # along: paint texture and noise
+        dv = ndi.gaussian_filter1d(v, 1.0 / step, axis=1, order=1)   # across: the step, at 1 px scale
+        g += dv * dv
+    g = np.sqrt(g) / step
+    g[(X <= 0.5) | (X >= W - 0.5) | (Y <= 0.5) | (Y >= H - 0.5)] = 0     # off the picture: no evidence
+    return s, t, g, L, u, nv
+
+
+def _side_steps(t, g):
+    """Every strong step in every row (local maxima of the gradient across the side, sub-pixel): row
+    indices, positions. All of them, not the strongest only: beside a painting's edge a frame's outer edge
+    against a light wall is often stronger, and the painting's edge must still get its votes."""
+    c = g[:, 1:-1]
+    ref = float(np.percentile(g.max(1), 80))
+    # strong: well above noise (about an 8-level step) and a fair share of what this side's edges reach
+    pk = (c >= g[:, :-2]) & (c > g[:, 2:]) & (c > max(0.008, 0.25 * ref))
+    rows, j = np.nonzero(pk)
+    j = j + 1
+    a, b, cc = g[rows, j - 1], g[rows, j], g[rows, j + 1]
+    den = a - 2 * b + cc
+    off = np.where(den < 0, 0.5 * (a - cc) / np.where(den < 0, den, -1), 0.0)
+    return rows, t[j] + np.clip(off, -0.5, 0.5) * (t[1] - t[0])
+
+
+def _rows_on(s, rows, pos, a, b, tol):
+    """Rows with a step within tol px of the line t = a + b s."""
+    return np.unique(rows[np.abs(pos - (a + b * s[rows])) < tol])
+
+
+def _line(s, rows, pos, near, tol=1.0):
+    """The line t = a + b s that most rows have a step on (within tol px). Close to the side as given
+    (within `near` px at its middle) a line on 40% of the rows is enough: a painting's edge softened by a
+    frame's shadow loses to the crisp outer edge of the frame on count alone. Otherwise, of the lines nearly
+    as well supported as the best, the nearest. Returns (a, b, rows on it) or None."""
+    if len(np.unique(rows)) < 6:
+        return None
+    rng = np.random.default_rng(0)            # deterministic: the same photo gives the same answer
+    cand = []
+    for i, j in rng.integers(0, len(rows), (160, 2)):
+        si, sj = s[rows[i]], s[rows[j]]
+        if abs(sj - si) < 0.15 * (s[-1] - s[0]):
+            continue
+        b = (pos[j] - pos[i]) / (sj - si)
+        if abs(b) > 0.06:                     # a side turns by a few degrees at most
+            continue
+        a = pos[i] - b * si
+        cand.append((len(_rows_on(s, rows, pos, a, b, tol)), abs(a + b * 0.5 * (s[0] + s[-1])), a, b))
+    if not cand:
+        return None
+    pool = [x for x in cand if x[1] <= near and x[0] >= 0.4 * len(s)] or cand
+    top = max(x[0] for x in pool)
+    _, _, a, b = min((x for x in pool if x[0] >= 0.8 * top), key=lambda x: x[1])
+    for _ in range(3):                        # least squares on the steps along it, one per row
+        near = np.abs(pos - (a + b * s[rows])) < tol
+        if len(np.unique(rows[near])) < 6:
+            return None
+        b, a = np.polyfit(s[rows[near]], pos[near], 1)
+    return a, b, _rows_on(s, rows, pos, a, b, tol)
+
+
+def _fit(planes, q, R):
+    """Move each side onto the edge running along it (R px search; 0: measure only). Returns the quad
+    and the support per side [top, right, bottom, left]."""
+    lines, support = [], []
+    for i in range(4):
+        a, b = q[i], q[(i + 1) % 4]
+        s, t, g, L, u, nv = _side(planes, a, b, max(R, 3.0))
+        rows, pos = _side_steps(t, g)
+        fit = _line(s, rows, pos, R * NEAR / REACH) if R > 0 else None
+        if fit is not None and len(fit[2]) >= 0.25 * len(s) and max(abs(fit[0]), abs(fit[0] + fit[1] * L)) <= R:
+            a0, b0, on = fit
+            lines.append((a + nv * a0, u + nv * b0))
+            support.append(len(on) / float(len(s)))
+        else:
+            lines.append((a, u))
+            support.append(len(_rows_on(s, rows, pos, 0.0, 0.0, 1.25)) / float(len(s)))
+    out = []
+    for i in range(4):
+        (p1, d1), (p2, d2) = lines[i - 1], lines[i]
+        try:
+            lam = np.linalg.solve(np.array([d1, -d2]).T, p2 - p1)[0]
+        except np.linalg.LinAlgError:
+            return q, support
+        out.append(p1 + lam * d1)
+    out = np.array(out)
+    if R > 0 and (np.hypot(*(out - q).T).max() > 2.5 * R or _canon(out) is None):
+        return _fit(planes, q, 0.0)            # the sides found do not make this quad: keep Vision's
+    return out, support
+
+
+def _merge(found, tol):
+    """One entry per outline: answers whose corners all lie within `tol` px are the same outline;
+    the better supported is kept, noting that both detectors found it."""
+    found = sorted(found, key=lambda f: -float(np.mean(f["support"])))
+    kept = []
+    for f in found:
+        same = next((k for k in kept if np.hypot(*(k["q"] - f["q"]).T).max() < tol), None)
+        if same is None:
+            f["sources"] = {f["source"]}
+            kept.append(f)
+        else:
+            same["sources"].add(f["source"])
+    return kept
+
+
+def _border_sides(q, W, H, tol, sides=range(4)):
+    """How many of the given sides of q run along the picture's own border (both ends within tol of it)."""
+    near = lambda p: (abs(p[0]) < tol, abs(p[0] - W) < tol, abs(p[1]) < tol, abs(p[1] - H) < tol)
+    return sum(any(x and y for x, y in zip(near(q[i]), near(q[(i + 1) % 4]))) for i in sides)
+
+
+def _quad_confidence(f, W, H):
+    q, sup = f["q"], np.asarray(f["support"])
+    edges = 0.7 * float(sup.mean()) + 0.3 * float(sup.min())
+    share = _area(q) / float(W * H)
+    size = float(np.clip((share - 0.03) / 0.12, 0, 1))      # 3% of the picture: nothing; 15%: no doubt
+    e = np.roll(q, -1, 0) - q
+    ang = [math.degrees(math.acos(np.clip(np.dot(-e[i - 1], e[i]) / (np.linalg.norm(e[i - 1]) * np.linalg.norm(e[i])), -1, 1)))
+           for i in range(4)]
+    worst = max(abs(a - 90) for a in ang)
+    shape = 1.0 if worst <= 35 else max(0.4, 1 - (worst - 35) / 30.0)
+    tol = max(4.0, 0.01 * math.hypot(W, H))
+    # The picture's own outline: Vision took all of it for the document (its grid puts the corners up to
+    # about 2% of the diagonal off the picture's; the sides may since have moved onto paint near the border).
+    f["whole"] = bool(np.hypot(*(f["vision"] - UNIT * [W, H]).T).max() <= 2 * tol)
+    # The work runs off the photo: a corner outside it, a side along its border, or a side near the border
+    # with no edge under it (Vision closed the outline where the photo ends).
+    border = _border_sides(q, W, H, tol)
+    blind = [i for i in range(4) if sup[i] < 0.2]
+    f["cut_off"] = not f["whole"] and bool(0 < border or _border_sides(q, W, H, 3 * tol, blind) or (q[:, 0] < -tol).any()
+                                           or (q[:, 1] < -tol).any() or (q[:, 0] > W + tol).any() or (q[:, 1] > H + tol).any())
+    c = edges * size * shape * (0.6 if f["cut_off"] else 1.0) + (0.08 if len(f["sources"]) > 1 else 0.0)
+    return 0.0 if f["whole"] else float(np.clip(c, 0, 1))
+
+
+UNIT = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
+
+
+def _homography(src, dst):
+    A = []
+    for (x, y), (u, v) in zip(src, dst):
+        A += [[x, y, 1, 0, 0, 0, -u * x, -u * y, -u], [0, 0, 0, x, y, 1, -v * x, -v * y, -v]]
+    h = np.linalg.svd(np.asarray(A, float))[2][-1]
+    return h.reshape(3, 3) / h[-1]
+
+
+def _band(outer, inner):
+    """The band between `outer` and `inner` as [top, right, bottom, left] widths (px at outer's scale), when
+    inner could be the next layer in: inside it, sides parallel in the work's own plane, about as wide on the
+    left as on the right and at most 3x on any side (a mat is often heavier at the bottom). Else None."""
+    p = np.c_[inner, np.ones(4)] @ _homography(outer, UNIT).T
+    p = p[:, :2] / p[:, 2:3]
+    if p.min() <= 0 or p.max() >= 1:
+        return None
+    w = 0.5 * (np.linalg.norm(outer[1] - outer[0]) + np.linalg.norm(outer[2] - outer[3]))
+    h = 0.5 * (np.linalg.norm(outer[3] - outer[0]) + np.linalg.norm(outer[2] - outer[1]))
+    band = np.array([0.5 * (p[0, 1] + p[1, 1]) * h, (1 - 0.5 * (p[1, 0] + p[2, 0])) * w,
+                     (1 - 0.5 * (p[2, 1] + p[3, 1])) * h, 0.5 * (p[0, 0] + p[3, 0]) * w])
+    skew = max(abs(p[0, 0] - p[3, 0]) * w, abs(p[1, 0] - p[2, 0]) * w, abs(p[0, 1] - p[1, 1]) * h, abs(p[3, 1] - p[2, 1]) * h)
+    lo, hi = float(band.min()), float(band.max())
+    if lo < max(1.5, 0.002 * max(w, h)) or hi > 0.3 * min(w, h) or hi > 3 * lo:
+        return None
+    if max(band[1], band[3]) > 1.8 * min(band[1], band[3]) or skew > 0.5 * lo + 0.004 * max(w, h):
+        return None
+    return band
+
+
+def _ranked(found, W, H, max_n):
+    n = len(found)
+    area = [_area(f["q"]) for f in found]
+    parent = [None] * n
+    # A layer is an outline the picture shows over most of its length (a painted area fading into its paper
+    # is not; a mat's window with one side white on white still is).
+    real = [float(np.mean(f["support"])) >= 0.5 and not f["whole"] for f in found]
+    for i in range(n):                        # the next layer out: the smallest outline round i with an even band
+        outs = [j for j in range(n) if j != i and real[i] and real[j] and area[j] > area[i]
+                and _band(found[j]["q"], found[i]["q"]) is not None]
+        if outs:
+            parent[i] = min(outs, key=lambda j: area[j])
+    # An outline inside a real one with no even band between them: close to its size and as clear, it is still
+    # the next layer in (a dark painting in a dark frame, or one side moved onto the neighbouring edge); much
+    # smaller, it is content of that picture (a window, a colour block), dealt with below.
+    conf = [f["confidence"] for f in found]
+    clear = lambda j, i: min(found[i]["support"]) >= 0.2 and conf[i] >= 0.7 * conf[j]
+    owner = {}
+    for r in sorted((i for i in range(n) if parent[i] is None and not found[i]["whole"]), key=lambda i: area[i]):
+        hosts = [j for j in range(n) if real[j] and area[j] > area[r] and _inside(found[j]["q"], found[r]["q"])]
+        if hosts:
+            h = min(hosts, key=lambda j: area[j])
+            if area[r] < 0.6 * area[h]:
+                owner[r] = h
+            elif real[r] and clear(h, r):
+                parent[r] = h
+    roots = [i for i in range(n) if parent[i] is None]
+
+    def members(r):
+        out, todo = [], [r]
+        while todo:
+            x = todo.pop()
+            out.append(x)
+            todo += [i for i in range(n) if parent[i] == x]
+        return out
+
+    def depth(i):
+        d = 0
+        while parent[i] is not None:
+            i, d = parent[i], d + 1
+        return d
+
+    chains = [members(r) for r in roots]
+    # Content (part of a picture, not a picture) goes after the others, at half confidence.
+    for c in chains:
+        if c[0] in owner:
+            for i in c:
+                found[i]["confidence"] *= 0.5
+    best = max([found[i]["confidence"] for c in chains if c[0] not in owner for i in c] or [0.0])
+    # The picture's own outline leads only when nothing else is convincing (a flat scan or screenshot).
+    key = lambda c: (c[0] in owner, not found[c[0]]["whole"] if best < 0.5 else found[c[0]]["whole"],
+                     -round(max(found[i]["confidence"] for i in c), 2), -len(c), -area[c[0]])
+    # innermost first; of two outlines at one depth (one of them a layer Vision found twice) the smaller
+    order = [i for c in sorted(chains, key=key) for i in sorted(c, key=lambda i: (-depth(i), area[i]))][:max_n]
+    pos = {i: k for k, i in enumerate(order)}
+    out = []
+    for i in order:
+        f = found[i]
+        kids = [j for j in range(n) if parent[j] == i and j in pos]
+        e = {"corners": _pts(UNIT * [W, H] if f["whole"] else f["q"]), "confidence": round(f["confidence"], 3),
+             "source": f["source"], "share": 1.0 if f["whole"] else round(area[i] / float(W * H), 4),
+             "support": [round(v, 2) for v in f["support"]],
+             "agree": len(f["sources"]) > 1, "nested_in": pos.get(parent[i]) if parent[i] is not None else None,
+             "holds": pos[max(kids, key=lambda j: area[j])] if kids else None, "cut_off": f["cut_off"],
+             "whole": f["whole"], "inside": pos.get(owner.get(_root(parent, i)))}
+        if f["whole"] or np.hypot(*(f["q"] - f["vision"]).T).max() >= 0.01:
+            e["vision"] = _pts(f["vision"])
+        out.append(e)
+    return out
+
+
+def _root(parent, i):
+    while parent[i] is not None:
+        i = parent[i]
+    return i
+
+
+def _inside(outer, inner, tol=0.02):
+    """inner's corners all within outer (a margin of 2% of outer's size allowed), in outer's own plane."""
+    p = np.c_[inner, np.ones(4)] @ _homography(outer, UNIT).T
+    p = p[:, :2] / p[:, 2:3]
+    return bool(p.min() >= -tol and p.max() <= 1 + tol)
